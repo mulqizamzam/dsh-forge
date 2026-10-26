@@ -59,6 +59,7 @@ async function callHostLLM(
   const llm = deps.ctx.get('llm') as
     { stream(opts: unknown): AsyncIterable<Record<string, unknown>> } | undefined
   if (!llm) throw new Error('LLM service not available on host context')
+  const llmService = llm
 
   const baseMessages = [{
     id: 'forge-' + Date.now().toString(36),
@@ -71,7 +72,7 @@ async function callHostLLM(
     const usage: LlmUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
     let text = ''
     let finishKind = 'unknown'
-    const stream = llm.stream({ provider, model, system: sys, messages: msgs, maxTokens: 8192, reasoningEffort: 'low' })
+    const stream = llmService.stream({ provider, model, system: sys, messages: msgs, maxTokens: 8192, reasoningEffort: 'low' })
     for await (const chunk of stream) {
       const type = chunk.type
       if (type === 'text-delta' && typeof chunk.text === 'string') text += chunk.text

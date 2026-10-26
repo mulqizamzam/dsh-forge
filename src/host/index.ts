@@ -48,7 +48,7 @@ export async function apply(rawContext: unknown, rawConfig: Partial<ForgeConfig>
         name: 'forge_status',
         description: 'dsh-forge failed to start; reports why. No other forge_* tool is available this session.',
         parameters: { type: 'object', properties: {} },
-        output: { schema: JSON_OBJECT_OUTPUT, render: (_a, v) => text(v) },
+        output: { schema: JSON_OBJECT_OUTPUT, render: (_a: Record<string, unknown>, v: never) => text(v) },
         execute: async () => ({
           plugin: 'dsh-forge',
           state: 'failed',

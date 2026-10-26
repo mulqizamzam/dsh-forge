@@ -34,7 +34,7 @@ export function forgeTools(deps: ModuleDeps): ToolDefinition[] {
         const repoRoot = typeof a.repoRoot === 'string' ? a.repoRoot : ''
         if (!repoRoot) return neutralizeDeep({ ok: false, error: 'repoRoot is required' })
         const r = await discoverRepo(repoRoot)
-        return neutralizeDeep(r.ok ? { ok: true, ...r } : r)
+        return neutralizeDeep(r)
       },
     } as never),
 
@@ -122,7 +122,7 @@ export function forgeTools(deps: ModuleDeps): ToolDefinition[] {
         const id = typeof a.id === 'string' ? a.id : ''
         const profile = typeof a.profile === 'string' ? a.profile : undefined
         const result = await installPlugin(deps, id, profile)
-        return neutralizeDeep(result.ok ? { ok: true, ...result } : result)
+        return neutralizeDeep(result)
       },
     } as never),
 
