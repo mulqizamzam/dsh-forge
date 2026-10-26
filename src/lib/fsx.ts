@@ -1,10 +1,14 @@
-import { readFile, writeFile, readdir, stat, unlink, mkdir } from 'node:fs/promises'
+import { readFile, writeFile, readdir, lstat, unlink, mkdir } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
 import { newId } from './ids.ts'
 
 /** Read JSON safely; null on any error. */
 export async function readJsonSafe(path: string): Promise<unknown> {
-  try { return JSON.parse(await readFile(path, 'utf8')) } catch { return null }
+  try {
+    const metadata = await lstat(path)
+    if (!metadata.isFile() || metadata.isSymbolicLink()) return null
+    return JSON.parse(await readFile(path, 'utf8'))
+  } catch { return null }
 }
 
 /** Atomic JSON write: write tmp then rename. Unique tmp name per call. */
@@ -32,8 +36,8 @@ export async function listDir(dir: string, limit = 500): Promise<string[]> {
     const withMtime: Array<{ name: string; mtime: number }> = []
     for (const name of entries) {
       try {
-        const s = await stat(join(dir, name))
-        if (s.isFile()) withMtime.push({ name, mtime: s.mtimeMs })
+        const s = await lstat(join(dir, name))
+        if (s.isFile() && !s.isSymbolicLink()) withMtime.push({ name, mtime: s.mtimeMs })
       } catch { /* skip */ }
     }
     withMtime.sort((a, b) => b.mtime - a.mtime)

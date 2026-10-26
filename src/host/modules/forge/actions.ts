@@ -170,6 +170,12 @@ function extractFileSet(content: string): { name: string; files: PluginFile[] } 
         totalBytes += bytes
         if (totalBytes > MAX_PLUGIN_BYTES) throw new Error('plugin exceeds 5 MiB total content limit')
       }
+      const packageFile = files.find(file => file.path === 'package.json')
+      if (!packageFile) throw new Error('generated plugin is missing package.json')
+      let declaredName: unknown
+      try { declaredName = (JSON.parse(packageFile.content) as Record<string, unknown>).name }
+      catch { throw new Error('generated package.json is not valid JSON') }
+      if (declaredName !== nameCandidate) throw new Error('generated name must match package.json name')
       return { name: nameCandidate, files }
     } catch (e) {
       lastErr = e instanceof Error ? e.message : String(e)
@@ -230,6 +236,7 @@ export function validatePlugin(files: PluginFile[]): { valid: boolean; errors: s
       if (typeof p.name !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(p.name)) {
         errors.push('package.json: "name" must be a lowercase package slug (1–100 chars)')
       } else packageName = p.name
+      if (p.type !== 'module') errors.push('package.json: "type" must be "module" for ESM plugin entries')
       if (typeof p.version !== 'string' || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(p.version)) {
         errors.push('package.json: "version" must be valid semver')
       }
@@ -250,8 +257,8 @@ export function validatePlugin(files: PluginFile[]): { valid: boolean; errors: s
   const patch = files.find(f => f.path === 'cordis.patch.yml')
   if (!patch) errors.push('missing cordis.patch.yml')
   else {
-    if (!/^\s*-\s*insert\s*:/m.test(patch.content)) errors.push('cordis.patch.yml must contain a top-level "insert:" block')
-    const patchId = patch.content.match(/^\s*-\s*id\s*:\s*([^\s#]+)\s*$/m)?.[1]?.replace(/^['"]|['"]$/g, '')
+    if (!/^[ \t]*-[ \t]*insert[ \t]*:/m.test(patch.content)) errors.push('cordis.patch.yml must contain a top-level "insert:" block')
+    const patchId = patch.content.match(/^[ \t]{4,}-[ \t]*id[ \t]*:[ \t]*([^\s#]+)[ \t]*$/m)?.[1]?.replace(/^['"]|['"]$/g, '')
     if (!patchId) errors.push('cordis.patch.yml must define an insert row with an id')
     else if (packageName && patchId !== packageName) errors.push('cordis.patch.yml insert id must match package.json name')
   }
@@ -268,7 +275,7 @@ export function validatePlugin(files: PluginFile[]): { valid: boolean; errors: s
     }
   }
   if (sourceEntry && runtimeEntry && sourceEntry.content !== runtimeEntry.content) {
-    warnings.push('src/index.js and lib/index.js differ; ensure runtime implementation matches reviewed source')
+    errors.push('src/index.js and lib/index.js must be identical so the tested source matches the installed runtime')
   }
   return { valid: errors.length === 0, errors, warnings }
 }
@@ -636,6 +643,7 @@ export async function activatePlugin(
 ): Promise<{ ok: true; toolNames: string[] } | { ok: false; error: string }> {
   const record = await deps.store.get(id)
   if (!record) return { ok: false, error: 'record not found: ' + id }
+  if (activeFibers.has(id)) return { ok: false, error: 'plugin is already active in this host' }
   if (!record.validation?.valid) return { ok: false, error: 'cannot activate: static validation must pass first' }
   if (!record.test?.passed) return { ok: false, error: 'cannot activate: sandbox test must pass first' }
 
@@ -701,9 +709,15 @@ export async function deactivatePlugin(
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const fiber = activeFibers.get(id)
   if (!fiber) return { ok: false, error: 'plugin is not active in this host' }
-  try { if (typeof fiber.dispose === 'function') await fiber.dispose() } catch { /* ignore */ }
+  try {
+    if (typeof fiber.dispose === 'function') await fiber.dispose()
+  } catch (e) {
+    return { ok: false, error: 'plugin disposal failed: ' + (e instanceof Error ? e.message : String(e)) }
+  }
   activeFibers.delete(id)
-  await deps.store.update(id, { status: 'installed', active: undefined })
+  const record = await deps.store.get(id)
+  const status = record?.install?.installed ? 'installed' : record?.test?.passed ? 'tested' : 'validated'
+  await deps.store.update(id, { status, active: undefined })
   return { ok: true }
 }
 
@@ -728,7 +742,8 @@ export async function exportPlugin(
       await mkdir(dirname(target), { recursive: true, mode: 0o755 })
       await writeFile(target, f.content, { encoding: 'utf8', mode: 0o644 })
     }
-    const out = resolve(outPath ?? join(deps.store.getRoot(), 'exports', `${record.name}-${id}.tgz`))
+    const safeRecordName = /^[a-z0-9][a-z0-9._-]{0,99}$/.test(record.name) ? record.name : 'plugin'
+    const out = resolve(outPath ?? join(deps.store.getRoot(), 'exports', `${safeRecordName}-${id}.tgz`))
     if (containPath(srcPath, out) !== null) return { ok: false, error: 'export path must be outside the staging directory' }
     await mkdir(dirname(out), { recursive: true })
     const r = await spawnProcess('tar', [

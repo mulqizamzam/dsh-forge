@@ -22,6 +22,10 @@ from pathlib import Path
 
 MAX_MEMBER = 5 * 1024 * 1024
 MAX_ENTRIES = 2000
+IGNORED_DIRS = {
+    ".git", "node_modules", "dist", "build", "coverage", "vendor",
+    ".next", ".cache", ".turbo", ".venv", "venv", "target", "out",
+}
 SECRET_BASENAME = re.compile(r"^(?:\.env(?:\..*)?|credentials?(?:\..*)?|secrets?(?:\..*)?|\.npmrc)$", re.I)
 APPLY_EXPORT_RE = re.compile(r"\bexport\s+(?:async\s+)?(?:function\s+apply\b|const\s+apply\b|let\s+apply\b|var\s+apply\b|\{[^}]*\bapply\b[^}]*\})")
 SKILL_FM_RE = re.compile(r"^---\s*\n(.*?)\n---", re.DOTALL)
@@ -34,6 +38,12 @@ def _walk(root: Path) -> tuple[list[Path], list[str]]:
         cur = Path(current)
         for name in list(dirs):
             p = cur / name
+            # These are generated checkout/dependency trees, not plugin package
+            # inputs (npm's "files" allowlist excludes them). Don't scan their
+            # symlinks or large binaries as if they were part of the plugin.
+            if name in IGNORED_DIRS:
+                dirs.remove(name)
+                continue
             if name == '__pycache__':
                 errors.append(f"transient Python bytecode cache is not allowed: {p.relative_to(root)}")
                 dirs.remove(name)

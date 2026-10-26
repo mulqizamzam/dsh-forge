@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile, symlink } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { ForgeStore } from '../src/host/store.ts'
@@ -109,6 +109,18 @@ describe('dsh-forge smoke', () => {
     ])
     expect(result.valid).toBe(false)
     expect(result.errors.join(' ')).toMatch(/MiB/)
+  })
+
+  it('rejects source/runtime entry drift', () => {
+    const entry = 'export function apply(ctx) { ctx.tools.register({ name: "t" }) }'
+    const result = validatePlugin([
+      { path: 'package.json', content: '{"name":"x","version":"1.0.0","type":"module","main":"lib/index.js","exports":{".":"./lib/index.js"},"dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}' },
+      { path: 'cordis.patch.yml', content: '- insert:\\n    - id: x\\n      name: x\\n      config: {}' },
+      { path: 'src/index.js', content: entry },
+      { path: 'lib/index.js', content: entry + '\\n// drift' },
+    ])
+    expect(result.valid).toBe(false)
+    expect(result.errors.join(' ')).toMatch(/identical/i)
   })
 
   it('validate accepts well-formed plugin', () => {
@@ -258,5 +270,13 @@ describe('dsh-forge store', () => {
     const updated = await store.update(rec.id, { status: 'validated' })
     expect(updated?.id).toBe(rec.id)
     expect(updated?.status).toBe('validated')
+  })
+
+  it('does not follow symlinked record files', async () => {
+    const outside = join(root, 'outside.json')
+    await writeFile(outside, JSON.stringify({ id: 'secret-record', name: 'external-data' }))
+    await symlink(outside, join(root, 'records', 'abcdef123456.json'))
+    expect(await store.get('abcdef123456')).toBeNull()
+    expect(await store.list()).toHaveLength(0)
   })
 })

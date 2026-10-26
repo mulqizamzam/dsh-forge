@@ -33,17 +33,8 @@ jobs:
           key: npm-${{ runner.os }}-node22-${{ hashFiles('package.json') }}
           restore-keys: |
             npm-${{ runner.os }}-node22-
-      - name: Install dependencies
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci --no-audit --no-fund
-          else
-            npm install --no-audit --no-fund
-          fi
-      - name: Emit generated lockfile for repository bootstrap (temporary)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: |
-          node -e "const fs=require('node:fs'); const s=fs.readFileSync('package-lock.json','utf8'); const b=Buffer.from(s).toString('base64'); console.log('LOCKFILE_START'); for(let i=0;i<b.length;i+=8000) console.log('LOCKFILE_CHUNK:'+i+':'+b.slice(i,i+8000)); console.log('LOCKFILE_END')"
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
       - name: Install bubblewrap for sandbox verification
         run: |
           if ! command -v bwrap >/dev/null 2>&1; then
