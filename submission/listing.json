@@ -1,0 +1,33 @@
+{
+  "name": "DSH Forge",
+  "subtitle": "Build DSH plugins from repos",
+  "description": "dsh-forge converts agentic repositories into validated, sandbox-tested, deterministically packaged DeepSeek Harness plugins. It discovers workflow candidates, generates complete DSH plugin source via LLM, validates the DSH contract (package.json dsh.bundle.patch, cordis.patch.yml insert block, apply export), runs bwrap sandbox tests with process-group timeout, gates install and activation on both validation and test success, and builds a submission packet for DSH profile maintenance.",
+  "category": "Developer Tools",
+  "developerName": "dsh-forge contributors",
+  "version": "0.2.0",
+  "packageName": "dsh-forge",
+  "capabilities": [
+    "Agentic repository discovery for DSH plugin candidates",
+    "DSH plugin generation from natural language via LLM",
+    "DSH contract static validation (fail-closed)",
+    "bwrap sandbox test with process-group timeout",
+    "Gated install into a DSH profile",
+    "Gated activation via ctx.plugin",
+    "Deterministic export as .tgz",
+    "Submission packet builder for DSH profiles"
+  ],
+  "starterPrompts": [
+    "Discover which workflows in this repo should become DSH plugin tools.",
+    "Generate a complete DSH plugin from this description, validate it, sandbox-test it.",
+    "Audit and package this existing DSH plugin for a profile submission."
+  ],
+  "hostCapabilities": {
+    "workspace": ["read", "list", "search", "grep", "write", "patch", "shell", "python"],
+    "note": "Host-native capabilities are used when available; the plugin does not grant these permissions."
+  },
+  "publisherVerification": {
+    "required": true,
+    "status": "verify-in-dsh-profile-before-submission"
+  },
+  "note": "Repository-maintained evidence format for DSH profile submission. Not a DSH marketplace schema, and not proof of profile approval."
+}

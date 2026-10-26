@@ -1,0 +1,25 @@
+# dsh-forge — bundle layer.
+#
+# Kill switch (top-level row override; do NOT wrap in `update:`):
+#
+#   - id: dsh-forge
+#     config:
+#       forge:
+#         install: { requireValidated: true, requireTested: true }
+#         sandbox: { enabled: false }
+#
+# The forge_* tools stay registered. To fully disable, remove dsh-forge from
+# the profile's dsh.profile.bundles list.
+- insert:
+    - id: dsh-forge
+      name: dsh-forge
+      config:
+        stateRoot: ""
+        forge:
+          defaultProfile: web
+          sandbox:
+            enabled: true
+            timeoutMs: 60000
+          install:
+            requireValidated: true
+            requireTested: true

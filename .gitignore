@@ -1,0 +1,10 @@
+node_modules/
+lib/
+*.tgz
+.dev/
+dist/
+scratch-*.ts
+.env
+.env.*
+__pycache__/
+*.pyc
