@@ -55,9 +55,10 @@ describe('dsh-forge smoke', () => {
 
   it('validate rejects plugin missing dsh.bundle.patch', () => {
     const result = validatePlugin([
-      { path: 'package.json', content: '{"name":"x","version":"1.0.0"}' },
+      { path: 'package.json', content: '{"name":"x","version":"1.0.0","type":"module","main":"lib/index.js","exports":{".":"./lib/index.js"}}' },
       { path: 'cordis.patch.yml', content: '- insert: []' },
-      { path: 'src/index.js', content: 'export function apply() {}' },
+      { path: 'src/index.js', content: 'export function apply(ctx) { ctx.tools.register({ name: "t", description: "d", parameters: {}, output: { schema: {}, render: () => [] }, execute: async () => ({}) }) }' },
+      { path: 'lib/index.js', content: 'export function apply(ctx) { ctx.tools.register({ name: "t", description: "d", parameters: {}, output: { schema: {}, render: () => [] }, execute: async () => ({}) }) }' },
     ])
     expect(result.valid).toBe(false)
     expect(result.errors.join(' ')).toMatch(/dsh/i)
@@ -65,9 +66,10 @@ describe('dsh-forge smoke', () => {
 
   it('validate rejects plugin missing insert: block', () => {
     const result = validatePlugin([
-      { path: 'package.json', content: '{"name":"x","version":"1.0.0","dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}' },
+      { path: 'package.json', content: '{"name":"x","version":"1.0.0","type":"module","main":"lib/index.js","exports":{".":"./lib/index.js"},"dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}' },
       { path: 'cordis.patch.yml', content: 'garbage' },
-      { path: 'src/index.js', content: 'export function apply() {}' },
+      { path: 'src/index.js', content: 'export function apply(ctx) { ctx.tools.register({ name: "t", description: "d", parameters: {}, output: { schema: {}, render: () => [] }, execute: async () => ({}) }) }' },
+      { path: 'lib/index.js', content: 'export function apply(ctx) { ctx.tools.register({ name: "t", description: "d", parameters: {}, output: { schema: {}, render: () => [] }, execute: async () => ({}) }) }' },
     ])
     expect(result.valid).toBe(false)
     expect(result.errors.join(' ')).toMatch(/insert/)
@@ -75,9 +77,10 @@ describe('dsh-forge smoke', () => {
 
   it('validate rejects plugin missing apply export', () => {
     const result = validatePlugin([
-      { path: 'package.json', content: '{"name":"x","version":"1.0.0","dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}' },
+      { path: 'package.json', content: '{"name":"x","version":"1.0.0","type":"module","main":"lib/index.js","exports":{".":"./lib/index.js"},"dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}' },
       { path: 'cordis.patch.yml', content: '- insert: []' },
       { path: 'src/index.js', content: 'export const x = 1' },
+      { path: 'lib/index.js', content: 'export const x = 1' },
     ])
     expect(result.valid).toBe(false)
     expect(result.errors.join(' ')).toMatch(/apply/)
@@ -86,9 +89,10 @@ describe('dsh-forge smoke', () => {
   it('validate rejects unsafe path traversal', () => {
     const result = validatePlugin([
       { path: '../evil.js', content: 'x' },
-      { path: 'package.json', content: '{"name":"x","version":"1.0.0","dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}' },
+      { path: 'package.json', content: '{"name":"x","version":"1.0.0","type":"module","main":"lib/index.js","exports":{".":"./lib/index.js"},"dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}' },
       { path: 'cordis.patch.yml', content: '- insert: []' },
-      { path: 'src/index.js', content: 'export function apply() {}' },
+      { path: 'src/index.js', content: 'export function apply(ctx) { ctx.tools.register({ name: "t", description: "d", parameters: {}, output: { schema: {}, render: () => [] }, execute: async () => ({}) }) }' },
+      { path: 'lib/index.js', content: 'export function apply(ctx) { ctx.tools.register({ name: "t", description: "d", parameters: {}, output: { schema: {}, render: () => [] }, execute: async () => ({}) }) }' },
     ])
     expect(result.valid).toBe(false)
     expect(result.errors.join(' ')).toMatch(/unsafe file path/)
@@ -97,9 +101,10 @@ describe('dsh-forge smoke', () => {
   it('validate rejects file over 1 MiB', () => {
     const bigContent = 'x'.repeat(2 * 1024 * 1024)
     const result = validatePlugin([
-      { path: 'package.json', content: '{"name":"x","version":"1.0.0","dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}' },
+      { path: 'package.json', content: '{"name":"x","version":"1.0.0","type":"module","main":"lib/index.js","exports":{".":"./lib/index.js"},"dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}' },
       { path: 'cordis.patch.yml', content: '- insert: []' },
-      { path: 'src/index.js', content: 'export function apply() {}' },
+      { path: 'src/index.js', content: 'export function apply(ctx) { ctx.tools.register({ name: "t", description: "d", parameters: {}, output: { schema: {}, render: () => [] }, execute: async () => ({}) }) }' },
+      { path: 'lib/index.js', content: 'export function apply(ctx) { ctx.tools.register({ name: "t", description: "d", parameters: {}, output: { schema: {}, render: () => [] }, execute: async () => ({}) }) }' },
       { path: 'assets/big.txt', content: bigContent },
     ])
     expect(result.valid).toBe(false)
@@ -108,7 +113,7 @@ describe('dsh-forge smoke', () => {
 
   it('validate accepts well-formed plugin', () => {
     const result = validatePlugin([
-      { path: 'package.json', content: '{"name":"x","version":"1.0.0","dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}' },
+      { path: 'package.json', content: '{"name":"x","version":"1.0.0","type":"module","main":"lib/index.js","exports":{".":"./lib/index.js"},"dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}' },
       { path: 'cordis.patch.yml', content: '- insert:\n    - id: x\n      name: x\n      config: {}' },
       { path: 'src/index.js', content: 'export function apply(ctx) { ctx.tools.register({ name: "t", description: "d", parameters: {}, output: { schema: {}, render: () => [] }, execute: async () => ({}) }) }' },
     ])
@@ -157,6 +162,45 @@ describe('dsh-forge install gate', () => {
     expect(listing.version).toBe('1.2.3')
     expect(listing.capabilities).toContain('foo')
     expect(listing.capabilities).toContain('bar')
+  })
+})
+
+describe('path and package hardening', () => {
+  it('rejects Windows and ambiguous paths', async () => {
+    const { containPath } = await import('../src/lib/contain.ts')
+    expect(containPath('/safe/root', 'C:\\Windows\\win.ini')).toBeNull()
+    expect(containPath('/safe/root', 'src\\..\\outside.js')).toBeNull()
+    expect(containPath('/safe/root', 'src/../outside.js')).toBeNull()
+    expect(containPath('/safe/root', 'src//index.js')).toBeNull()
+    expect(containPath('/safe/root', 'src/index.js')).not.toBeNull()
+  })
+
+  it('rejects duplicate package paths and reserved secret paths', () => {
+    const validPackage = '{"name":"x","version":"1.0.0","type":"module","main":"lib/index.js","exports":{".":"./lib/index.js"},"dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}'
+    const entry = 'export function apply(ctx) { ctx.tools.register({ name: "t" }) }'
+    const result = validatePlugin([
+      { path: 'package.json', content: validPackage },
+      { path: 'cordis.patch.yml', content: '- insert:\\n    - id: x\\n      name: x\\n      config: {}' },
+      { path: 'src/index.js', content: entry },
+      { path: 'lib/index.js', content: entry },
+      { path: '.env', content: 'TOKEN=secret' },
+      { path: 'lib/index.js', content: entry },
+    ])
+    expect(result.valid).toBe(false)
+    expect(result.errors.join(' ')).toMatch(/duplicate file path/i)
+    expect(result.errors.join(' ')).toMatch(/sensitive|vendor/i)
+  })
+
+  it('requires package main entry and registry identity to match', () => {
+    const entry = 'export function apply(ctx) { ctx.tools.register({ name: "t" }) }'
+    const result = validatePlugin([
+      { path: 'package.json', content: '{"name":"one","version":"1.0.0","main":"missing.js","exports":{".":"./missing.js"},"dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}' },
+      { path: 'cordis.patch.yml', content: '- insert:\\n    - id: another\\n      name: another\\n      config: {}' },
+      { path: 'src/index.js', content: entry },
+      { path: 'lib/index.js', content: entry },
+    ])
+    expect(result.valid).toBe(false)
+    expect(result.errors.join(' ')).toMatch(/main|exports|match/i)
   })
 })
 

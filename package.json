@@ -4,8 +4,12 @@
   "description": "DSH plugin factory — discover agentic repos, generate DSH plugins via LLM, validate, sandbox-test, install, activate, and package deterministically. Includes a DSH-adapted skill set for workflow discovery, compilation, brand identity, listing preparation, and reviewer evidence.",
   "type": "module",
   "license": "MIT",
-  "author": { "name": "dsh-forge contributors" },
-  "engines": { "node": ">=20" },
+  "author": {
+    "name": "dsh-forge contributors"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
@@ -23,8 +27,12 @@
     "LICENSE"
   ],
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
-    "engines": { "dsh": ">=0.1.1-rc.1" }
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "engines": {
+      "dsh": ">=0.1.1-rc.1"
+    }
   },
   "scripts": {
     "build": "tsdown",
@@ -41,5 +49,6 @@
     "tsdown": "^0.22.14",
     "typescript": "^5.9.3",
     "vitest": "^3.2.7"
-  }
+  },
+  "packageManager": "npm@10.9.9"
 }

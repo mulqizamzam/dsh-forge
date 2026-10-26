@@ -23,7 +23,8 @@ Output ONE JSON object and nothing else:
   "files": [
     {"path": "package.json", "content": "..."},
     {"path": "cordis.patch.yml", "content": "..."},
-    {"path": "src/index.js", "content": "..."}
+    {"path": "src/index.js", "content": "..."},
+    {"path": "lib/index.js", "content": "..."}
   ]
 }
 
@@ -33,8 +34,10 @@ DSH plugin contract (authoritative):
   "dsh.engines.dsh": ">=0.1.1-rc.1"
 - cordis.patch.yml MUST contain a top-level "insert:" block with one row:
   [{ id: <name>, name: <name>, config: {} }]
-- src/index.js MUST export an async apply(ctx, config) function that registers
-  at least one tool via ctx.tools.register({ name, description, parameters, output, execute }).
+- src/index.js and lib/index.js MUST both export an async apply(ctx, config) function
+  that registers at least one tool via ctx.tools.register({ name, description, parameters, output, execute }).
+- lib/index.js is the runtime entry and MUST contain the same executable ESM implementation as src/index.js.
+- package.json main MUST be "lib/index.js" and exports["."] MUST be "./lib/index.js".
 - No TypeScript build step is permitted. Files must be plain .js ESM.
 
 Rules:
@@ -151,6 +154,22 @@ function extractFileSet(content: string): { name: string; files: PluginFile[] } 
         }
       }
       if (files.length === 0) { lastErr = 'no files array'; continue }
+      if (!/^[a-z0-9][a-z0-9._-]{0,99}$/.test(nameCandidate)) {
+        throw new Error('plugin name must be a lowercase package slug (1–100 chars)')
+      }
+      if (files.length > MAX_PLUGIN_FILES) throw new Error('plugin contains more than ' + MAX_PLUGIN_FILES + ' files')
+      const seenPaths = new Set<string>()
+      let totalBytes = 0
+      for (const file of files) {
+        if (containPath('/plugin-root', file.path) === null) throw new Error('unsafe file path: ' + file.path)
+        const portablePath = file.path.toLowerCase()
+        if (seenPaths.has(portablePath)) throw new Error('duplicate file path: ' + file.path)
+        seenPaths.add(portablePath)
+        const bytes = Buffer.byteLength(file.content, 'utf8')
+        if (bytes > MAX_FILE_BYTES) throw new Error('file exceeds 1 MiB size cap: ' + file.path)
+        totalBytes += bytes
+        if (totalBytes > MAX_PLUGIN_BYTES) throw new Error('plugin exceeds 5 MiB total content limit')
+      }
       return { name: nameCandidate, files }
     } catch (e) {
       lastErr = e instanceof Error ? e.message : String(e)
@@ -171,29 +190,54 @@ function extractFileSet(content: string): { name: string; files: PluginFile[] } 
 // ─────────────────────────────────────────────────────────────────────────────
 
 const APPLY_EXPORT_RE = /\bexport\s+(async\s+)?(function\s+apply\b|const\s+apply\b|let\s+apply\b|var\s+apply\b|\{[^}]*\bapply\b[^}]*\})/
-const MAX_FILE_BYTES = 1 * 1024 * 1024 // M2 fix — size cap per file
+const MAX_FILE_BYTES = 1 * 1024 * 1024 // per-file content cap
+const MAX_PLUGIN_BYTES = 5 * 1024 * 1024 // aggregate model output / storage cap
+const MAX_PLUGIN_FILES = 200
+const MAX_CAPTURE_CHARS = 64 * 1024
+const FORBIDDEN_SEGMENT_RE = /^(?:\.git|node_modules|\.env(?:\..*)?|\.npmrc|\.pypirc|credentials?(?:\..*)?|secrets?(?:\..*)?|id_(?:rsa|ed25519))$/i
 
 export function validatePlugin(files: PluginFile[]): { valid: boolean; errors: string[]; warnings: string[] } {
   const errors: string[] = []
   const warnings: string[] = []
+  if (files.length > MAX_PLUGIN_FILES) errors.push('plugin exceeds ' + MAX_PLUGIN_FILES + ' file limit')
 
+  const seenPaths = new Set<string>()
+  let totalBytes = 0
   for (const f of files) {
     if (containPath('/plugin-root', f.path) === null) {
       errors.push('unsafe file path: ' + f.path)
+      continue
     }
-    if (f.content.length > MAX_FILE_BYTES) {
-      errors.push('file exceeds 1 MiB size cap: ' + f.path)
+    const portablePath = f.path.toLowerCase()
+    if (seenPaths.has(portablePath)) errors.push('duplicate file path: ' + f.path)
+    seenPaths.add(portablePath)
+    if (f.path.split('/').some(segment => FORBIDDEN_SEGMENT_RE.test(segment))) {
+      errors.push('sensitive or vendor path is not allowed: ' + f.path)
     }
+    const bytes = Buffer.byteLength(f.content, 'utf8')
+    totalBytes += bytes
+    if (bytes > MAX_FILE_BYTES) errors.push('file exceeds 1 MiB size cap: ' + f.path)
   }
+  if (totalBytes > MAX_PLUGIN_BYTES) errors.push('plugin exceeds 5 MiB total content limit')
   if (errors.length > 0) return { valid: false, errors, warnings }
 
   const pkg = files.find(f => f.path === 'package.json')
+  let packageName: string | undefined
   if (!pkg) errors.push('missing package.json')
   else {
     try {
       const p = JSON.parse(pkg.content) as Record<string, unknown>
-      if (typeof p.name !== 'string' || p.name === '') errors.push('package.json: "name" is required')
-      if (typeof p.version !== 'string' || !/^\d+\.\d+\.\d+/.test(p.version)) errors.push('package.json: "version" must be semver')
+      if (typeof p.name !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(p.name)) {
+        errors.push('package.json: "name" must be a lowercase package slug (1–100 chars)')
+      } else packageName = p.name
+      if (typeof p.version !== 'string' || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(p.version)) {
+        errors.push('package.json: "version" must be valid semver')
+      }
+      if (p.main !== 'lib/index.js') errors.push('package.json: "main" must be "lib/index.js"')
+      const exports = p.exports as Record<string, unknown> | undefined
+      if (!exports || typeof exports !== 'object' || exports['.'] !== './lib/index.js') {
+        errors.push('package.json: exports["."] must be "./lib/index.js"')
+      }
       const dsh = p.dsh as Record<string, unknown> | undefined
       if (!dsh || typeof dsh !== 'object') errors.push('package.json: "dsh" object is required')
       else {
@@ -205,16 +249,27 @@ export function validatePlugin(files: PluginFile[]): { valid: boolean; errors: s
 
   const patch = files.find(f => f.path === 'cordis.patch.yml')
   if (!patch) errors.push('missing cordis.patch.yml')
-  else if (!patch.content.includes('insert:')) errors.push('cordis.patch.yml must contain an "insert:" block')
-
-  const entry = files.find(f => f.path === 'src/index.js')
-  if (!entry) errors.push('missing entry file: src/index.js is required')
-  else if (!APPLY_EXPORT_RE.test(entry.content)) {
-    errors.push('src/index.js must export an "apply" symbol (export function apply / export const apply / export { apply })')
-  } else if (!entry.content.includes('ctx.tools.register') && !entry.content.includes('.tools.register')) {
-    warnings.push('src/index.js exports apply but does not visibly call ctx.tools.register — the plugin may register no tools')
+  else {
+    if (!/^\s*-\s*insert\s*:/m.test(patch.content)) errors.push('cordis.patch.yml must contain a top-level "insert:" block')
+    const patchId = patch.content.match(/^\s*-\s*id\s*:\s*([^\s#]+)\s*$/m)?.[1]?.replace(/^['"]|['"]$/g, '')
+    if (!patchId) errors.push('cordis.patch.yml must define an insert row with an id')
+    else if (packageName && patchId !== packageName) errors.push('cordis.patch.yml insert id must match package.json name')
   }
 
+  const sourceEntry = files.find(f => f.path === 'src/index.js')
+  const runtimeEntry = files.find(f => f.path === 'lib/index.js')
+  if (!sourceEntry) errors.push('missing source entry: src/index.js is required')
+  if (!runtimeEntry) errors.push('missing runtime entry: lib/index.js is required by package.json')
+  for (const [label, entry] of [['src/index.js', sourceEntry], ['lib/index.js', runtimeEntry]] as const) {
+    if (!entry) continue
+    if (!APPLY_EXPORT_RE.test(entry.content)) errors.push(label + ' must export an "apply" symbol')
+    if (!entry.content.includes('ctx.tools.register') && !entry.content.includes('.tools.register')) {
+      errors.push(label + ' must register at least one DSH tool')
+    }
+  }
+  if (sourceEntry && runtimeEntry && sourceEntry.content !== runtimeEntry.content) {
+    warnings.push('src/index.js and lib/index.js differ; ensure runtime implementation matches reviewed source')
+  }
   return { valid: errors.length === 0, errors, warnings }
 }
 
@@ -225,27 +280,46 @@ export function validatePlugin(files: PluginFile[]): { valid: boolean; errors: s
 export async function discoverRepo(repoRoot: string): Promise<{
   ok: true
   candidates: DiscoveryCandidate[]
-  summary: { fileCount: number; candidateCount: number }
+  summary: { fileCount: number; candidateCount: number; limitReached: boolean }
 } | { ok: false; error: string }> {
   const root = resolve(repoRoot)
-  try { await access(root) } catch { return { ok: false, error: 'repo root not found: ' + root } }
+  const { readdir, lstat } = await import('node:fs/promises')
+  let rootStat
+  try { rootStat = await lstat(root) } catch { return { ok: false, error: 'repo root not found: ' + root } }
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    return { ok: false, error: 'repo root must be a real directory (not a symlink): ' + root }
+  }
 
   const candidates: DiscoveryCandidate[] = []
-  const { readdir, stat } = await import('node:fs/promises')
+  const MAX_DISCOVERY_ENTRIES = 10_000
+  const MAX_CANDIDATES = 500
+  const ignoredDirs = new Set([
+    '.git', 'node_modules', 'dist', 'lib', 'build', 'coverage', 'vendor',
+    '.next', '.cache', '.turbo', '.venv', 'venv', 'target', 'out',
+  ])
+  let visitedEntries = 0
+  let scannedFileCount = 0
+  let limitReached = false
 
   async function walk(dir: string, depth: number): Promise<void> {
-    if (depth > 4) return
-    let names: string[]
-    try { names = await readdir(dir) } catch { return }
-    for (const name of names) {
-      if (name === 'node_modules' || name === '.git' || name === 'dist' || name === 'lib') continue
-      const full = join(dir, name)
-      let s: Awaited<ReturnType<typeof stat>>
-      try { s = await stat(full) } catch { continue }
-      if (s.isDirectory()) { await walk(full, depth + 1); continue }
-      if (!s.isFile()) continue
-      if (!/\.(md|markdown|yaml|yml|json)$/.test(name)) continue
-      const rel = full.slice(root.length + 1).split(/[\\/]/).join('/')
+    if (depth > 5 || limitReached || candidates.length >= MAX_CANDIDATES) return
+    let entries
+    try { entries = await readdir(dir, { withFileTypes: true }) } catch { return }
+    entries.sort((a, b) => a.name.localeCompare(b.name))
+    for (const entry of entries) {
+      if (limitReached || candidates.length >= MAX_CANDIDATES) return
+      visitedEntries++
+      if (visitedEntries > MAX_DISCOVERY_ENTRIES) { limitReached = true; return }
+      if (entry.isSymbolicLink()) continue
+      if (entry.isDirectory()) {
+        if (!ignoredDirs.has(entry.name)) await walk(join(dir, entry.name), depth + 1)
+        continue
+      }
+      if (!entry.isFile()) continue
+      scannedFileCount++
+      const name = entry.name
+      if (!/\.(md|markdown|yaml|yml|json)$/i.test(name)) continue
+      const rel = join(dir, name).slice(root.length + 1).split(/[\\/]/).join('/')
       if (name === 'SKILL.md') {
         candidates.push({ path: rel, kind: 'skill_md', slug: slugFromPath(rel), score: 100, recommendedTarget: 'preserve', reasons: ['existing Agent Skill'] })
       } else if (name === 'AGENTS.md' || name === 'CLAUDE.md' || name === 'GEMINI.md') {
@@ -260,8 +334,11 @@ export async function discoverRepo(repoRoot: string): Promise<{
 
   await walk(root, 0)
   candidates.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
-
-  return { ok: true, candidates, summary: { fileCount: candidates.length, candidateCount: candidates.length } }
+  return {
+    ok: true,
+    candidates,
+    summary: { fileCount: scannedFileCount, candidateCount: candidates.length, limitReached },
+  }
 }
 
 function slugFromPath(rel: string): string {
@@ -278,10 +355,24 @@ function exists(p: string): Promise<boolean> {
 
 async function bwrapAvailable(): Promise<boolean> {
   return new Promise(resolve => {
-    const c = spawn('bwrap', ['--version'], { stdio: 'ignore', detached: true })
-    c.on('close', code => resolve(code === 0))
-    c.on('error', () => resolve(false))
-    setTimeout(() => { try { if (c.pid) process.kill(-c.pid, 'SIGKILL'); else c.kill() } catch { /* ignore */ } resolve(false) }, 3000)
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const finish = (available: boolean) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      resolve(available)
+    }
+    const child = spawn('bwrap', ['--version'], { stdio: 'ignore', detached: true })
+    child.once('close', code => finish(code === 0))
+    child.once('error', () => finish(false))
+    timer = setTimeout(() => {
+      try {
+        if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL')
+        else child.kill('SIGKILL')
+      } catch { /* process may have exited */ }
+      finish(false)
+    }, 3000)
   })
 }
 
@@ -303,8 +394,16 @@ function spawnProcess(
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: true,
     })
-    child.stdout?.on('data', d => { stdout += d.toString() })
-    child.stderr?.on('data', d => { stderr += d.toString() })
+    const appendBounded = (current: string, chunk: unknown): string => {
+      if (current.length >= MAX_CAPTURE_CHARS) return current
+      const remaining = MAX_CAPTURE_CHARS - current.length
+      return current + String(chunk).slice(0, remaining)
+    }
+    child.stdout?.on('data', d => { stdout = appendBounded(stdout, d) })
+    child.stderr?.on('data', d => { stderr = appendBounded(stderr, d) })
+    const safeTimeoutMs = Number.isFinite(opts.timeoutMs)
+      ? Math.max(100, Math.min(5 * 60_000, Math.floor(opts.timeoutMs)))
+      : 60_000
     const timer = setTimeout(() => {
       try {
         if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL')
@@ -343,8 +442,8 @@ export async function testInSandbox(
       await mkdir(dirname(target), { recursive: true })
       await writeFile(target, f.content, 'utf8')
     }
-    const entry = files.find(f => f.path === 'src/index.js')?.path
-    if (!entry) return { passed: false, exitCode: null, stdout: '', stderr: 'no src/index.js', durationMs: 0, checkedAt }
+    const entry = files.find(f => f.path === 'lib/index.js')?.path
+    if (!entry) return { passed: false, exitCode: null, stdout: '', stderr: 'no lib/index.js runtime entry', durationMs: 0, checkedAt }
 
     const harnessPath = join(workDir, '.forge-test.mjs')
     await writeFile(harnessPath, `
@@ -366,20 +465,59 @@ if (registered.length === 0) { console.error('NO_TOOLS_REGISTERED'); process.exi
 console.log('OK_TOOLS:' + registered.join(','))
 `, 'utf8')
 
-    const bwrapArgs: string[] = ['--clearenv']
-    for (const p of ['/usr', '/lib', '/lib64', '/bin', '/sbin']) {
-      if (await exists(p)) bwrapArgs.push('--ro-bind', p, p)
-    }
-    const nodeBinDir = dirname(process.execPath)
-    if (await exists(nodeBinDir)) bwrapArgs.push('--ro-bind', nodeBinDir, nodeBinDir)
-    bwrapArgs.push(
-      '--bind', workDir, workDir,
-      '--chdir', workDir,
+    const bwrapArgs: string[] = [
+      '--clearenv',
+      '--unshare-user',
       '--unshare-pid',
       '--unshare-net',
-      '--proc', '/proc',
-      '--dev', '/dev',
+      '--tmpfs', '/',
+    ]
+    // Build an allowlisted, read-only system view. The empty root is critical:
+    // bind-mounting only /usr and /lib without tmpfs / still exposes the host disk.
+    for (const p of ['/usr', '/etc']) {
+      if (await exists(p)) {
+        bwrapArgs.push('--dir', p, '--ro-bind', p, p)
+      }
+    }
+    for (const p of ['/lib', '/lib64', '/bin', '/sbin']) {
+      if (!(await exists(p))) continue
+      const { lstat, readlink } = await import('node:fs/promises')
+      const info = await lstat(p).catch(() => null)
+      if (!info) continue
+      if (info.isSymbolicLink()) {
+        bwrapArgs.push('--symlink', await readlink(p), p)
+      } else {
+        bwrapArgs.push('--dir', p, '--ro-bind', p, p)
+      }
+    }
+
+    const nodeBinDir = dirname(process.execPath)
+    if (await exists(nodeBinDir)) {
+      // The toolchain may live below /opt/hostedtoolcache rather than /usr.
+      const relativeToRoot = nodeBinDir.startsWith('/') ? nodeBinDir.slice(1) : nodeBinDir
+      const segments = relativeToRoot.split('/').filter(Boolean)
+      let current = ''
+      const systemRoots = ['/usr', '/etc', '/lib', '/lib64', '/bin', '/sbin']
+      for (const segment of segments) {
+        current += '/' + segment
+        if (systemRoots.some(p => current === p || current.startsWith(p + '/'))) continue
+        bwrapArgs.push('--dir', current)
+      }
+      bwrapArgs.push('--ro-bind', nodeBinDir, nodeBinDir)
+    }
+
+    bwrapArgs.push(
+      '--dir', '/tmp',
       '--tmpfs', '/tmp',
+      '--dir', workDir,
+      '--bind', workDir, workDir,
+      '--dir', '/proc',
+      '--proc', '/proc',
+      '--dir', '/dev',
+      '--dev', '/dev',
+      '--chdir', workDir,
+      '--setenv', 'HOME', '/tmp',
+      '--setenv', 'TMPDIR', '/tmp',
       '--setenv', 'PATH', nodeBinDir + ':/usr/local/bin:/usr/bin:/bin',
       '/bin/sh', '-c', 'node .forge-test.mjs',
     )
@@ -435,6 +573,9 @@ export async function installPlugin(
     return { ok: false, error: 'refusing to install: sandbox test must pass first (run forge_test)' }
   }
   const chosenProfile = profile || cfg.defaultProfile
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(chosenProfile)) {
+    return { ok: false, error: 'invalid DSH profile name; use letters, digits, underscore, or hyphen (max 64 chars)' }
+  }
   const installPath = join(deps.store.getRoot(), 'installed', id)
   await rm(installPath, { recursive: true, force: true }).catch(() => { /* ignore */ })
   for (const f of record.files) {
@@ -498,17 +639,19 @@ export async function activatePlugin(
   if (!record.validation?.valid) return { ok: false, error: 'cannot activate: static validation must pass first' }
   if (!record.test?.passed) return { ok: false, error: 'cannot activate: sandbox test must pass first' }
 
-  const installPath = record.install?.installPath ?? join(deps.store.getRoot(), 'installed', id)
-  const entryFile = record.files.find(f => f.path === 'src/index.js')
-  if (!entryFile) return { ok: false, error: 'record has no src/index.js' }
-  const entryPath = join(installPath, entryFile.path)
-  if (!(await exists(entryPath))) {
-    for (const f of record.files) {
-      const target = containPath(installPath, f.path)
-      if (target === null) return { ok: false, error: 'unsafe file path: ' + f.path }
-      await mkdir(dirname(target), { recursive: true })
-      await writeFile(target, f.content, 'utf8')
-    }
+  // Never trust installPath loaded from mutable JSON; derive the path from the
+  // configured store root and record ID, and recreate the tree to remove symlinks
+  // or stale files left by a previously interrupted write.
+  const installPath = join(deps.store.getRoot(), 'installed', id)
+  const runtimeEntry = record.files.find(f => f.path === 'lib/index.js')
+  if (!runtimeEntry) return { ok: false, error: 'record has no lib/index.js runtime entry' }
+  const entryPath = join(installPath, runtimeEntry.path)
+  try { await rm(installPath, { recursive: true, force: true }) } catch { /* recreate below; writes still fail closed */ }
+  for (const f of record.files) {
+    const target = containPath(installPath, f.path)
+    if (target === null) return { ok: false, error: 'unsafe file path: ' + f.path }
+    await mkdir(dirname(target), { recursive: true })
+    await writeFile(target, f.content, { encoding: 'utf8', mode: 0o644 })
   }
 
   const ctx = deps.ctx
@@ -575,20 +718,28 @@ export async function exportPlugin(
 ): Promise<{ ok: true; outPath: string } | { ok: false; error: string }> {
   const record = await deps.store.get(id)
   if (!record) return { ok: false, error: 'record not found: ' + id }
-  const srcPath = record.install?.installPath ?? join(deps.store.getRoot(), 'installed', id)
-  if (!(await exists(srcPath))) {
+  // Export stored record content, never an installPath loaded from persisted JSON
+  // or mutable files that may have appeared in the installed directory.
+  const srcPath = await mkdtemp(join(tmpdir(), 'forge-export-'))
+  try {
     for (const f of record.files) {
       const target = containPath(srcPath, f.path)
       if (target === null) return { ok: false, error: 'unsafe file path: ' + f.path }
-      await mkdir(dirname(target), { recursive: true })
-      await writeFile(target, f.content, 'utf8')
+      await mkdir(dirname(target), { recursive: true, mode: 0o755 })
+      await writeFile(target, f.content, { encoding: 'utf8', mode: 0o644 })
     }
+    const out = resolve(outPath ?? join(deps.store.getRoot(), 'exports', `${record.name}-${id}.tgz`))
+    if (containPath(srcPath, out) !== null) return { ok: false, error: 'export path must be outside the staging directory' }
+    await mkdir(dirname(out), { recursive: true })
+    const r = await spawnProcess('tar', [
+      '--sort=name', '--mtime=@0', '--owner=0', '--group=0', '--numeric-owner',
+      '-czf', out, '-C', srcPath, '.',
+    ], { timeoutMs: 30_000 })
+    if (r.exitCode !== 0) return { ok: false, error: 'tar failed: ' + r.stderr.slice(0, 500) }
+    return { ok: true, outPath: out }
+  } finally {
+    await rm(srcPath, { recursive: true, force: true }).catch(() => { /* ignore */ })
   }
-  const out = outPath ?? join(deps.store.getRoot(), 'exports', `${record.name}-${id}.tgz`)
-  await mkdir(dirname(out), { recursive: true })
-  const r = await spawnProcess('tar', ['-czf', out, '-C', srcPath, '.'], { timeoutMs: 30_000 })
-  if (r.exitCode !== 0) return { ok: false, error: 'tar failed: ' + r.stderr.slice(0, 500) }
-  return { ok: true, outPath: out }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
