@@ -411,7 +411,7 @@ function spawnProcess(
       } catch {
         try { child.kill('SIGKILL') } catch { /* ignore */ }
       }
-    }, opts.timeoutMs)
+    }, safeTimeoutMs)
     child.on('close', code => { clearTimeout(timer); resolve({ exitCode: code, stdout, stderr, durationMs: Date.now() - start }) })
     child.on('error', e => {
       clearTimeout(timer)

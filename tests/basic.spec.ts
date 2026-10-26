@@ -116,6 +116,7 @@ describe('dsh-forge smoke', () => {
       { path: 'package.json', content: '{"name":"x","version":"1.0.0","type":"module","main":"lib/index.js","exports":{".":"./lib/index.js"},"dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}' },
       { path: 'cordis.patch.yml', content: '- insert:\n    - id: x\n      name: x\n      config: {}' },
       { path: 'src/index.js', content: 'export function apply(ctx) { ctx.tools.register({ name: "t", description: "d", parameters: {}, output: { schema: {}, render: () => [] }, execute: async () => ({}) }) }' },
+      { path: 'lib/index.js', content: 'export function apply(ctx) { ctx.tools.register({ name: "t", description: "d", parameters: {}, output: { schema: {}, render: () => [] }, execute: async () => ({}) }) }' },
     ])
     expect(result.valid).toBe(true)
   })
@@ -180,7 +181,7 @@ describe('path and package hardening', () => {
     const entry = 'export function apply(ctx) { ctx.tools.register({ name: "t" }) }'
     const result = validatePlugin([
       { path: 'package.json', content: validPackage },
-      { path: 'cordis.patch.yml', content: '- insert:\\n    - id: x\\n      name: x\\n      config: {}' },
+      { path: 'cordis.patch.yml', content: '- insert:\n    - id: x\n      name: x\n      config: {}' },
       { path: 'src/index.js', content: entry },
       { path: 'lib/index.js', content: entry },
       { path: '.env', content: 'TOKEN=secret' },
@@ -195,7 +196,7 @@ describe('path and package hardening', () => {
     const entry = 'export function apply(ctx) { ctx.tools.register({ name: "t" }) }'
     const result = validatePlugin([
       { path: 'package.json', content: '{"name":"one","version":"1.0.0","main":"missing.js","exports":{".":"./missing.js"},"dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}' },
-      { path: 'cordis.patch.yml', content: '- insert:\\n    - id: another\\n      name: another\\n      config: {}' },
+      { path: 'cordis.patch.yml', content: '- insert:\n    - id: another\n      name: another\n      config: {}' },
       { path: 'src/index.js', content: entry },
       { path: 'lib/index.js', content: entry },
     ])
