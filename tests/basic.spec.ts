@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { ForgeStore } from '../src/host/store.ts'
 import { resolveConfig } from '../src/host/config.ts'
 import { forgeTools } from '../src/host/modules/forge/tools.ts'
-import { validatePlugin } from '../src/host/modules/forge/actions.ts'
+import { validatePlugin, testInSandbox } from '../src/host/modules/forge/actions.ts'
 import type { ModuleDeps } from '../src/host/types.ts'
 import type { HostContextShape } from '../src/host/dsh.ts'
 
@@ -203,6 +203,26 @@ describe('path and package hardening', () => {
     expect(result.valid).toBe(false)
     expect(result.errors.join(' ')).toMatch(/main|exports|match/i)
   })
+})
+
+describe('runtime sandbox', () => {
+  it('runs the runtime entry inside an isolated bubblewrap filesystem', async () => {
+    const entry = `import { existsSync } from 'node:fs'
+export async function apply(ctx) {
+  if (existsSync('/home')) throw new Error('host home directory is visible in sandbox')
+  if (process.env.DSH_HOME) throw new Error('host DSH_HOME leaked into sandbox')
+  ctx.tools.register({ name: 'sandbox-smoke' })
+}`
+    const files = [
+      { path: 'package.json', content: '{"name":"sandbox-smoke","type":"module","main":"lib/index.js"}' },
+      { path: 'src/index.js', content: entry },
+      { path: 'lib/index.js', content: entry },
+    ]
+    const result = await testInSandbox(makeDeps(store), files, 15_000)
+    expect(result.passed, result.stderr).toBe(true)
+    expect(result.stdout).toContain('OK_TOOLS:sandbox-smoke')
+  })
+
 })
 
 describe('dsh-forge store', () => {
