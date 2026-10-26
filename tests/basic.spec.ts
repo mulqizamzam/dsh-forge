@@ -218,7 +218,7 @@ export async function apply(ctx) {
       { path: 'src/index.js', content: entry },
       { path: 'lib/index.js', content: entry },
     ]
-    const result = await testInSandbox(makeDeps(store), files, 15_000)
+    const result = await testInSandbox({} as ModuleDeps, files, 15_000)
     expect(result.passed, result.stderr).toBe(true)
     expect(result.stdout).toContain('OK_TOOLS:sandbox-smoke')
   })
