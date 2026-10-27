@@ -47,7 +47,7 @@
   "devDependencies": {
     "@types/node": "^22.20.3",
     "tsdown": "^0.22.14",
-    "typescript": "^5.9.3",
+    "typescript": "^7.0.2",
     "vitest": "5.0.5"
   },
   "packageManager": "npm@10.9.9"
