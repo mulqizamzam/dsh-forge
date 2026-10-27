@@ -498,20 +498,11 @@ console.log('OK_TOOLS:' + registered.join(','))
       }
     }
 
-    const nodeBinDir = dirname(process.execPath)
-    if (await exists(nodeBinDir)) {
-      // The toolchain may live below /opt/hostedtoolcache rather than /usr.
-      const relativeToRoot = nodeBinDir.startsWith('/') ? nodeBinDir.slice(1) : nodeBinDir
-      const segments = relativeToRoot.split('/').filter(Boolean)
-      let current = ''
-      const systemRoots = ['/usr', '/etc', '/lib', '/lib64', '/bin', '/sbin']
-      for (const segment of segments) {
-        current += '/' + segment
-        if (systemRoots.some(p => current === p || current.startsWith(p + '/'))) continue
-        bwrapArgs.push('--dir', current)
-      }
-      bwrapArgs.push('--ro-bind', nodeBinDir, nodeBinDir)
-    }
+    // Bind-mount the node binary directly into the sandbox's /tmp to avoid
+    // creating --dir entries for host path segments (e.g. /home on nvm installs)
+    // that would leak the host directory structure. Placed after --tmpfs /tmp so
+    // the bind-mount overlays the empty tmpfs at that path.
+    const nodeBinary = process.execPath
 
     bwrapArgs.push(
       '--dir', '/tmp',
@@ -525,7 +516,14 @@ console.log('OK_TOOLS:' + registered.join(','))
       '--chdir', workDir,
       '--setenv', 'HOME', '/tmp',
       '--setenv', 'TMPDIR', '/tmp',
-      '--setenv', 'PATH', nodeBinDir + ':/usr/local/bin:/usr/bin:/bin',
+      '--setenv', 'PATH', '/tmp:/usr/local/bin:/usr/bin:/bin',
+    )
+
+    if (await exists(nodeBinary)) {
+      bwrapArgs.push('--ro-bind', nodeBinary, '/tmp/node')
+    }
+
+    bwrapArgs.push(
       '/bin/sh', '-c', 'node .forge-test.mjs',
     )
 
