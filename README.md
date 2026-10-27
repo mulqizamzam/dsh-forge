@@ -1,57 +1,78 @@
 # dsh-forge
 
-**DSH plugin factory.** Discover, generate, validate, sandbox-test, install, activate, and export DeepSeek Harness plugins — with a full-parity discipline adapted from `chatgpt-codex-plugin-autopilot`.
+**Build, validate, test, and package plugins for DeepSeek Harness (DSH).**
 
-> **Status:** v0.2.0. DSH-adapted. Full-parity structure: fail-closed validation, deterministic packaging, submission evidence, and reviewer-grade documentation. MCP explicitly out of scope for v0.2.
+`dsh-forge` is a DSH plugin-development workflow that turns a description or an existing agentic repository into a plugin, then checks it before installation or activation. It provides discovery, LLM-assisted generation, static validation, sandbox testing, install/activation gates, exports, and submission metadata.
 
-## What's new vs v0.1.0
+> **Current scope:** v0.2.0. This release targets the DSH plugin contract. MCP support is not implemented.
 
-- **C1 fix**: `activatePlugin` restores `ctx.tools.register` on the success path via `finally`, not only on error.
-- **H1 fix**: `spawnProcess` uses `detached: true` + `process.kill(-pid, 'SIGKILL')` on timeout, so `node` grandchildren inside `bwrap` cannot survive a `forge_test` timeout.
-- **H2 fix**: `callHostLLM` retries once with a directive when the first attempt returns empty output (thinking routes commonly exhaust the token budget on reasoning).
-- **H3 fix**: `extractFileSet` surfaces "files array exists but all entries invalid" instead of the misleading "no files array".
-- **M2 fix**: per-file size cap of 1 MiB in `validatePlugin`.
-- **L2 fix**: `uninstallPlugin` restores `tested` status instead of `installed`.
-- **New tool** `forge_discover` — read-only repo analysis (parity with `analyze_repo.py`).
-- **New tool** `forge_submit` — submission packet builder (parity with `build_directory_pack.py`).
-- **New skill** `skills/dsh-plugin-autopilot/SKILL.md` + `references/dsh-official-contract.md` — the DSH contract, adapted from the OpenAI/Codex reference.
-- **New skill** `skills/agentic-repo-discovery/SKILL.md` — workflow discovery discipline.
-- **New skill** `skills/host-workspace-operator/SKILL.md` — host-native capability routing.
-- **New** `skills/dsh-plugin-autopilot/scripts/validate_plugin.py` — Python validator (dependency-free) usable from CLI or CI.
-- **New** `submission/listing.json` — submission evidence packet template.
+## Why dsh-forge?
 
-## Tools
+Plugin code runs with meaningful access to its host. dsh-forge adds a repeatable workflow around that risk:
 
-| Tool | Purpose |
+- **Discover** reusable workflows in an existing repository.
+- **Generate** a plugin from a natural-language description.
+- **Validate** the manifest, registry patch, entry point, paths, and file sizes.
+- **Test** the plugin in a Bubblewrap (`bwrap`) sandbox with a fake host context.
+- **Gate** installation and activation on successful validation and testing.
+- **Export** a packaged plugin and prepare submission metadata.
+
+Validation and sandbox tests reduce risk; they do **not** prove that a plugin is safe or compatible with every real host environment.
+
+## Features
+
+| Tool | What it does |
 |---|---|
-| `forge_discover` | Read-only repo analysis: find DSH-plugin-worthy workflow candidates |
-| `forge_generate` | LLM generates a complete DSH plugin from a text description |
-| `forge_validate` | Static validation: `package.json` dsh contract, `cordis.patch.yml` insert block, `apply` export, path safety, size cap |
-| `forge_test` | bwrap sandbox: import entry, call `apply` with fake ctx, require ≥1 tool registered, process-group timeout |
-| `forge_install` | `dsh plugin add <path>` — **GATED on validate + test** |
-| `forge_uninstall` | `dsh plugin remove <pkg-name>` — restores previous status |
-| `forge_activate` | `ctx.plugin(module)` — mount in current host — **GATED on validate + test** |
-| `forge_deactivate` | Dispose the mounted fiber |
-| `forge_export` | Package as `.tgz` via `tar -czf` |
-| `forge_submit` | Build a submission packet (listing metadata) for a validated + tested record |
-| `forge_list` | List stored records |
-| `forge_inspect` | Full record details |
+| `forge_discover` | Read-only analysis of a repository to identify promising plugin workflows |
+| `forge_generate` | Generates a plugin from a text description using the configured host LLM |
+| `forge_validate` | Checks the DSH package contract, `cordis.patch.yml`, `apply` export, path safety, and file-size limits |
+| `forge_test` | Runs a shallow sandbox test: imports the entry point and calls `apply` with a fake context |
+| `forge_install` | Installs a plugin through `dsh plugin add`, subject to the validation/test gates |
+| `forge_uninstall` | Removes a plugin through `dsh plugin remove` |
+| `forge_activate` | Mounts a plugin in the current host through `ctx.plugin(module)`, subject to the gates |
+| `forge_deactivate` | Disposes the active plugin fiber |
+| `forge_export` | Creates a `.tgz` package |
+| `forge_submit` | Builds a submission packet from a validated and tested record |
+| `forge_list` | Lists stored plugin records |
+| `forge_inspect` | Shows details for a stored record |
 
-## Safety — the install gate
+## Requirements
 
-`forge_install` and `forge_activate` both require:
+- Node.js **20 or later**
+- npm (the repository pins npm **10.9.9** as its package manager)
+- A compatible DSH host; the package declares DSH **`>=0.1.1-rc.1`**
+- Linux with Bubblewrap (`bwrap`) for the sandbox test workflow
 
-1. `record.validation.valid === true` — `package.json` dsh contract, `cordis.patch.yml` insert block, `apply` export, path safety, size cap.
-2. `record.test.passed === true` — bwrap-sandboxed, `apply()` called with a fake ctx, ≥1 tool registered, process-group timeout on failure.
+The sandbox test depends on the host environment and available kernel/user-namespace features. If `bwrap` cannot run in your environment, do not treat a skipped or unavailable sandbox test as a successful test.
 
-Both gates are configurable (`forge.install.requireValidated`, `forge.install.requireTested`) but **do not disable them**. Disabling either gate means `dsh plugin add` or `ctx.plugin` runs against un-vetted code that can modify your profile or your running host.
+## Install
 
-## Config
+Install from the repository using DSH:
+
+```bash
+dsh plugin --profile web add github:mulqizamzam/dsh-forge#main
+```
+
+Or build and install from source:
+
+```bash
+git clone https://github.com/mulqizamzam/dsh-forge.git
+cd dsh-forge
+npm ci
+npm run build
+dsh plugin --profile web add .
+```
+
+Replace `web` with the DSH profile you intend to use.
+
+## Configuration
+
+Example plugin configuration:
 
 ```yaml
 - id: dsh-forge
   config:
-    stateRoot: ""              # empty = $DSH_HOME/dsh-forge/<profile>
+    stateRoot: "" # Empty uses $DSH_HOME/dsh-forge/<profile>
     forge:
       defaultProfile: web
       sandbox:
@@ -62,75 +83,72 @@ Both gates are configurable (`forge.install.requireValidated`, `forge.install.re
         requireTested: true
 ```
 
-## State layout
+Keep both install gates enabled. Setting either `requireValidated` or `requireTested` to `false` permits code to be installed or activated without that check. Only do so in a disposable environment when you understand the consequences.
 
-```
-$DSH_HOME/dsh-forge/<profile>/
-├── records/<id>.json    # ForgeRecord (files, validation, test, install, active)
-├── installed/<id>/      # materialized plugin files ready for dsh plugin add
-└── exports/<name>-<id>.tgz
-```
+## How the safety gates work
 
-Set `stateRoot` to override the default.
+By default, both `forge_install` and `forge_activate` require:
 
-## Install
+1. **Successful static validation** — the plugin manifest and DSH contract, `cordis.patch.yml` insert block, `apply` export, path checks, and per-file size limit must pass.
+2. **A successful sandbox test** — the entry point must import and `apply` must register at least one tool against a fake host context within the configured timeout.
 
-```
-dsh plugin --profile web add github:<you>/dsh-forge#main
-```
+These are preflight checks, not a security boundary for all plugin behavior. The test uses a fake context and cannot verify every real-host API interaction. Installation mutates the real DSH profile and is not run inside the sandbox. A plugin may still behave unexpectedly after installation or activation.
 
-## Build from source
-
-```
-git clone <this repo>
-cd dsh-forge
-npm install
-npm run build
-dsh plugin --profile web add .
-```
+Read [SECURITY.md](SECURITY.md) before running plugins you did not write or audit.
 
 ## Development
 
-```
+Install locked dependencies and run the project checks:
+
+```bash
+npm ci
 npm run typecheck
 npm test
 npm run build
+npm run validate
+```
+
+The dependency-free Python validator can also be run directly:
+
+```bash
 python3 skills/dsh-plugin-autopilot/scripts/validate_plugin.py . --json
 ```
 
-## Full-parity mapping (vs `chatgpt-codex-plugin-autopilot`)
+CI runs the automated test, type-check, plugin-contract validation, and dependency-audit workflow. See [GitHub Actions](https://github.com/mulqizamzam/dsh-forge/actions).
 
-| Reference discipline ↕▾ | dsh-forge equivalent ↕▾ |
-|---|---|
-| −`.codex-plugin/plugin.json` | `package.json` with `dsh.bundle.patch` |
-| −`action.yml` (GitHub Action) | `cordis.patch.yml` (DSH registry row) |
-| −`skills/*/SKILL.md` (9 skills) | 3 skills + full official-contract reference (more can be added without changing the contract) |
-| −`scripts/action_entrypoint.py` | `src/host/index.ts` + `src/host/modules/forge/actions.ts` |
-| −`scripts/self_check.py` | `skills/dsh-plugin-autopilot/scripts/validate_plugin.py` |
-| −`scripts/build_release.py` | `forge_export` (tar-based, deterministic) |
-| −`submission/listing.json` | `submission/listing.json` (template) + `forge_submit` tool |
-| −bwrap sandbox in skill scripts | `testInSandbox` in `actions.ts` |
-| −Fail-closed validation | `validatePlugin` in `actions.ts` |
-| −Lossless JSON tool returns | `neutralizeDeep` in `src/lib/sanitize.ts` |
-| −Process-group SIGKILL on timeout | `spawnProcess` in `actions.ts` |
+## State and generated artifacts
 
-**DSH-specific adaptations not present in the reference:**
+By default, records are stored under:
 
-- Manifest is `package.json` with `dsh.bundle.patch`, not `.codex-plugin/plugin.json`.
-- Registry is `cordis.patch.yml` with `- insert:` block, not `marketplace.json`.
-- Activation is `ctx.plugin(module, config)`, not OpenAI marketplace install.
-- Settings live-scope is `ctx.settings.register(ns, schema, { applies: 'live' })`.
-- Host Python is unavailable in-process; sandbox is `bwrap` via `spawn`.
-- "Submission" means DSH profile review, not OpenAI marketplace approval.
+```text
+$DSH_HOME/dsh-forge/<profile>/
+├── records/<id>.json
+├── installed/<id>/
+└── exports/<name>-<id>.tgz
+```
 
-## Known limitations (v0.2.0)
+- `records/` stores plugin records and their validation, test, install, and activation state.
+- `installed/` stores materialized plugin files used for installation.
+- `exports/` stores generated `.tgz` archives.
 
-- **LLM generation quality.** Contract is injected; expect ~10–20% retry rate on empty content, plus occasional invalid JSON. Validation catches most issues.
-- **Sandbox test is shallow.** It imports the entry and calls `apply` with a fake `ctx`. A plugin that passes can still fail against the real host (missing service, wrong API shape).
-- **Install is un-sandboxed.** `dsh plugin add` must mutate the real DSH profile, so it runs outside `bwrap`. The only protection is the validate + test gate.
-- **No install rollback.** `forge_uninstall` removes the plugin from the profile, but files the plugin wrote outside its own directory are not cleaned up.
-- **MCP is not implemented.** Explicitly out of scope for v0.2.
+Set `stateRoot` to use a different state directory.
+
+## Included skills and references
+
+- [DSH plugin autopilot](skills/dsh-plugin-autopilot/SKILL.md) — plugin generation and validation workflow
+- [Agentic repository discovery](skills/agentic-repo-discovery/SKILL.md) — finding reusable workflows in repositories
+- [Host workspace operator](skills/host-workspace-operator/SKILL.md) — routing work through host-native capabilities
+- [Official DSH contract reference](skills/dsh-plugin-autopilot/references/dsh-official-contract.md) — contract notes used by the workflow
+- [Submission listing template](submission/listing.json) — metadata template for submission preparation
+
+## Known limitations
+
+- **Generation can fail.** LLM output may be empty, malformed, or inconsistent with the contract; generated plugins still need review.
+- **Sandbox testing is shallow.** It checks import and basic tool registration against a fake context, not full behavior in a production DSH host.
+- **Installation is not sandboxed.** Installing changes the selected DSH profile.
+- **Uninstall is not a full rollback.** It removes the plugin from the profile but cannot undo arbitrary external side effects or clean files the plugin wrote elsewhere.
+- **MCP support is out of scope** for v0.2.0.
 
 ## License
 
-MIT
+[MIT](LICENSE)
