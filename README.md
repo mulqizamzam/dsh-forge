@@ -53,7 +53,7 @@ Install from the repository using DSH:
 dsh plugin --profile web add github:mulqizamzam/dsh-forge#main
 ```
 
-Or build and install from source:
+Or install from a local source checkout (the build runs automatically):
 
 ```bash
 git clone https://github.com/mulqizamzam/dsh-forge.git
