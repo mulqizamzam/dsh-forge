@@ -796,7 +796,9 @@ export async function installPlugin(
   deps: ModuleDeps,
   id: string,
   profile?: string,
-): Promise<{ ok: true; installPath: string; profile: string } | { ok: false; error: string }> {
+): Promise<{
+  if (!beginLifecycleOperation(id)) return { ok: false, error: 'another lifecycle operation is already in progress for this record, or the record ID is invalid' }
+  try { ok: true; installPath: string; profile: string } | { ok: false; error: string }> {
   const record = await deps.store.get(id)
   if (!record) return { ok: false, error: 'record not found or invalid record ID: ' + id }
   if (activeFibers.has(id)) return { ok: false, error: 'deactivate the plugin before reinstalling it' }
@@ -835,6 +837,10 @@ export async function installPlugin(
   } catch (e) {
     return { ok: false, error: 'install failed: ' + (e instanceof Error ? e.message : String(e)) }
   }
+
+  } finally {
+    endLifecycleOperation(id)
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -844,7 +850,9 @@ export async function installPlugin(
 export async function uninstallPlugin(
   deps: ModuleDeps,
   id: string,
-): Promise<{ ok: true } | { ok: false; error: string }> {
+): Promise<{
+  if (!beginLifecycleOperation(id)) return { ok: false, error: 'another lifecycle operation is already in progress for this record, or the record ID is invalid' }
+  try { ok: true } | { ok: false; error: string }> {
   const record = await deps.store.get(id)
   if (!record) return { ok: false, error: 'record not found or invalid record ID: ' + id }
   if (activeFibers.has(id)) return { ok: false, error: 'deactivate the plugin before uninstalling it' }
@@ -891,10 +899,28 @@ export async function uninstallPlugin(
 type ActivePlugin = { fiber: { dispose?: () => unknown; state?: unknown; inertia?: Promise<unknown> }; activePath: string; disposed?: boolean }
 const activeFibers = new Map<string, ActivePlugin>()
 
+const lifecycleOperations = new Set<string>()
+
+function beginLifecycleOperation(id: string): boolean {
+  if (!/^[a-f0-9]{12}$/.test(id) || lifecycleOperations.has(id)) return false
+  lifecycleOperations.add(id)
+  return true
+}
+
+function endLifecycleOperation(id: string): void {
+  lifecycleOperations.delete(id)
+
+  } finally {
+    endLifecycleOperation(id)
+  }
+}
+
 export async function activatePlugin(
   deps: ModuleDeps,
   id: string,
-): Promise<{ ok: true; toolNames: string[] } | { ok: false; error: string }> {
+): Promise<{
+  if (!beginLifecycleOperation(id)) return { ok: false, error: 'another lifecycle operation is already in progress for this record, or the record ID is invalid' }
+  try { ok: true; toolNames: string[] } | { ok: false; error: string }> {
   const record = await deps.store.get(id)
   if (!record) return { ok: false, error: 'record not found or invalid record ID: ' + id }
   if (activeFibers.has(id)) return { ok: false, error: 'plugin is already active in this host' }
@@ -1004,12 +1030,18 @@ export async function activatePlugin(
     return { ok: false, error: 'mount failed: ' + mountError }
   }
   return { ok: true, toolNames: registered }
+
+  } finally {
+    endLifecycleOperation(id)
+  }
 }
 
 export async function deactivatePlugin(
   deps: ModuleDeps,
   id: string,
-): Promise<{ ok: true } | { ok: false; error: string }> {
+): Promise<{
+  if (!beginLifecycleOperation(id)) return { ok: false, error: 'another lifecycle operation is already in progress for this record, or the record ID is invalid' }
+  try { ok: true } | { ok: false; error: string }> {
   if (!/^[a-f0-9]{12}$/.test(id)) return { ok: false, error: 'invalid record ID' }
   const active = activeFibers.get(id)
   if (!active) return { ok: false, error: 'plugin is not active in this host' }
@@ -1043,6 +1075,10 @@ export async function deactivatePlugin(
   }
   activeFibers.delete(id)
   return { ok: true }
+
+  } finally {
+    endLifecycleOperation(id)
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1075,6 +1111,8 @@ export async function exportPlugin(
   }
 
   const srcPath = await mkdtemp(join(tmpdir(), 'forge-export-'))
+  const stagedOut = join(exportRoot, '.' + safeRecordName + '-' + id + '-' + Date.now().toString(36) + '.tmp.tgz')
+  let archiveCommitted = false
   try {
     for (const file of record.files) {
       const target = containPath(srcPath, file.path)
@@ -1084,14 +1122,17 @@ export async function exportPlugin(
     }
     const r = await spawnProcess('tar', [
       '--sort=name', '--mtime=@0', '--owner=0', '--group=0', '--numeric-owner',
-      '-czf', out, '-C', srcPath, '.',
+      '-czf', stagedOut, '-C', srcPath, '.',
     ], { timeoutMs: 30_000 })
     const output = (r.stdout + '\n' + r.stderr).trim()
     if (r.exitCode !== 0) return { ok: false, error: 'tar failed (exit ' + String(r.exitCode) + '): ' + (output || 'no diagnostic output').slice(0, 1000) }
+    await (await import('node:fs/promises')).rename(stagedOut, out)
+    archiveCommitted = true
     return { ok: true, outPath: out }
   } catch (e) {
     return { ok: false, error: 'export failed: ' + (e instanceof Error ? e.message : String(e)) }
   } finally {
+    if (!archiveCommitted) await rm(stagedOut, { force: true }).catch(() => {})
     await rm(srcPath, { recursive: true, force: true }).catch(() => { /* ignore */ })
   }
 }

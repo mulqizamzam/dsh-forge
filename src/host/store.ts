@@ -113,8 +113,47 @@ export class ForgeStore {
       && typeof (file as Record<string, unknown>).path === 'string'
       && typeof (file as Record<string, unknown>).content === 'string'
     )) return null
-    if (typeof record.createdAt !== 'string' || typeof record.updatedAt !== 'string') return null
+    if (typeof record.createdAt !== 'string' || !Number.isFinite(Date.parse(record.createdAt))) return null
+    if (typeof record.updatedAt !== 'string' || !Number.isFinite(Date.parse(record.updatedAt))) return null
     if (!['generated', 'validated', 'tested', 'installed', 'active', 'failed'].includes(String(record.status))) return null
+    if (record.validation !== undefined) {
+      if (!record.validation || typeof record.validation !== 'object' || Array.isArray(record.validation)) return null
+      const validation = record.validation as Record<string, unknown>
+      if (typeof validation.valid !== 'boolean' || !Array.isArray(validation.errors) ||
+          !validation.errors.every(v => typeof v === 'string') || !Array.isArray(validation.warnings) ||
+          !validation.warnings.every(v => typeof v === 'string') ||
+          typeof validation.checkedAt !== 'string' || !Number.isFinite(Date.parse(validation.checkedAt))) return null
+      if (validation.contentSha256 !== undefined && (typeof validation.contentSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(validation.contentSha256))) return null
+    }
+    if (record.test !== undefined) {
+      if (!record.test || typeof record.test !== 'object' || Array.isArray(record.test)) return null
+      const test = record.test as Record<string, unknown>
+      if (typeof test.passed !== 'boolean' || !(test.exitCode === null || (typeof test.exitCode === 'number' && Number.isInteger(test.exitCode))) ||
+          typeof test.stdout !== 'string' || typeof test.stderr !== 'string' ||
+          typeof test.durationMs !== 'number' || !Number.isFinite(test.durationMs) || test.durationMs < 0 ||
+          typeof test.checkedAt !== 'string' || !Number.isFinite(Date.parse(test.checkedAt))) return null
+      if (test.contentSha256 !== undefined && (typeof test.contentSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(test.contentSha256))) return null
+    }
+    if (record.install !== undefined) {
+      if (!record.install || typeof record.install !== 'object' || Array.isArray(record.install)) return null
+      const install = record.install as Record<string, unknown>
+      if (typeof install.installed !== 'boolean' || typeof install.profile !== 'string' ||
+          typeof install.installPath !== 'string' || typeof install.at !== 'string' || !Number.isFinite(Date.parse(install.at))) return null
+      if (install.installed && !/^[a-zA-Z0-9_-]{1,64}$/.test(install.profile)) return null
+    }
+    if (record.active !== undefined) {
+      if (!record.active || typeof record.active !== 'object' || Array.isArray(record.active)) return null
+      const active = record.active as Record<string, unknown>
+      if (typeof active.mounted !== 'boolean' || !Array.isArray(active.toolNames) ||
+          !active.toolNames.every(v => typeof v === 'string') || typeof active.at !== 'string' ||
+          !Number.isFinite(Date.parse(active.at))) return null
+    }
+    if (record.llmUsage !== undefined) {
+      if (!record.llmUsage || typeof record.llmUsage !== 'object' || Array.isArray(record.llmUsage)) return null
+      const usage = record.llmUsage as Record<string, unknown>
+      if (!['inputTokens', 'outputTokens', 'totalTokens'].every(k =>
+        typeof usage[k] === 'number' && Number.isFinite(usage[k]) && Number(usage[k]) >= 0)) return null
+    }
     return value as ForgeRecord
   }
 

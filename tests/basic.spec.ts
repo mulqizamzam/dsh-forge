@@ -6,7 +6,7 @@ import { ForgeStore } from '../src/host/store.ts'
 import { readJsonSafe, writeJsonAtomic } from '../src/lib/fsx.ts'
 import { resolveConfig } from '../src/host/config.ts'
 import { forgeTools } from '../src/host/modules/forge/tools.ts'
-import { validatePlugin, testInSandbox, pluginContentDigest, validateRuntimeToolDefinition } from '../src/host/modules/forge/actions.ts'
+import { validatePlugin, testInSandbox, pluginContentDigest, validateRuntimeToolDefinition, installPlugin, activatePlugin } from '../src/host/modules/forge/actions.ts'
 import type { ModuleDeps } from '../src/host/types.ts'
 import type { HostContextShape } from '../src/host/dsh.ts'
 
@@ -482,5 +482,36 @@ describe('symlink and TOCTOU hardening', () => {
     await symlink(outside, link)
     const store = new ForgeStore({ root: link })
     await expect(store.init()).rejects.toThrow(/symlink/i)
+  })
+})
+
+
+describe('lifecycle and persisted-state hardening', () => {
+  let root: string
+  let store: ForgeStore
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'forge-lifecycle-'))
+    store = new ForgeStore({ root })
+    await store.init()
+  })
+  afterEach(async () => { await rm(root, { recursive: true, force: true }) })
+
+  it('rejects records with malformed nested validation state', async () => {
+    const record = await store.add({ name: 'x', description: 'd', files: [] })
+    const recordPath = join(root, 'records', record.id + '.json')
+    const malformed = { ...record, validation: { valid: 'yes', errors: [], warnings: [], checkedAt: 'not-a-date' } }
+    await writeFile(recordPath, JSON.stringify(malformed))
+    expect(await store.get(record.id)).toBeNull()
+  })
+
+  it('rejects simultaneous lifecycle operations for the same record', async () => {
+    const record = await store.add({ name: 'x', description: 'd', files: [] })
+    const deps = makeDeps(store)
+    const [first, second] = await Promise.all([
+      installPlugin(deps, record.id),
+      activatePlugin(deps, record.id),
+    ])
+    expect(first.ok).toBe(false)
+    expect(second.ok).toBe(false)
   })
 })
