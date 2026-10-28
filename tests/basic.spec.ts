@@ -8,7 +8,7 @@ import { ForgeStore } from '../src/host/store.ts'
 import { readJsonSafe, writeJsonAtomic } from '../src/lib/fsx.ts'
 import { resolveConfig } from '../src/host/config.ts'
 import { forgeTools } from '../src/host/modules/forge/tools.ts'
-import { validatePlugin, testInSandbox, pluginContentDigest, validateRuntimeToolDefinition, installPlugin, activatePlugin, deactivatePlugin, exportPlugin } from '../src/host/modules/forge/actions.ts'
+import { validatePlugin, testInSandbox, pluginContentDigest, validateRuntimeToolDefinition, installPlugin, activatePlugin, deactivatePlugin, exportPlugin, reconcilePluginOperation } from '../src/host/modules/forge/actions.ts'
 import type { ModuleDeps } from '../src/host/types.ts'
 import type { HostContextShape } from '../src/host/dsh.ts'
 
@@ -85,7 +85,7 @@ describe('dsh-forge smoke', () => {
 
   it('registers 10 forge action tools', () => {
     const tools = forgeTools(makeDeps(store))
-    expect(tools.length).toBe(10)
+    expect(tools.length).toBe(11)
     const names = tools.map(t => t.name).sort()
     expect(names).toEqual([
       'forge_activate',
@@ -94,6 +94,7 @@ describe('dsh-forge smoke', () => {
       'forge_export',
       'forge_generate',
       'forge_install',
+      'forge_reconcile',
       'forge_submit',
       'forge_test',
       'forge_uninstall',

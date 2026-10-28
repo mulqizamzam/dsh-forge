@@ -825,17 +825,6 @@ function statusAfterUninstall(record: ForgeRecord): ForgeRecord['status'] {
   return 'generated'
 }
 
-function packageNameFor(record: ForgeRecord): string {
-  const pkg = record.files.find(file => file.path === 'package.json')
-  if (pkg) {
-    try {
-      const parsed = JSON.parse(pkg.content) as Record<string, unknown>
-      if (typeof parsed.name === 'string') return parsed.name
-    } catch { /* rejected by safety gate when malformed */ }
-  }
-  return record.name
-}
-
 function freshEvidenceError(
   record: ForgeRecord,
   options: { requireValidation: boolean; requireTest: boolean },
