@@ -18,3 +18,4 @@ Please use GitHub's private vulnerability reporting for this repository when it 
 - The validator rejects traversal paths, duplicate paths, secret-shaped paths, oversized files, unsupported package entrypoint layouts, package lifecycle scripts, and external dependency declarations.
 - Install/uninstall leave a journal around external DSH mutations. A record with an unfinished operation must be reconciled from observed DSH profile state; never infer success or failure from a missing response alone.
 - File locks provide same-host, local-filesystem coordination. They do not provide distributed locking for a shared network filesystem across hosts.
+- Stale-lock reclamation is serialized by a short-lived recovery marker. If a process crashes while holding that marker, lock attempts fail closed; inspect its owner and remove it manually only after confirming no recovery process is alive.
