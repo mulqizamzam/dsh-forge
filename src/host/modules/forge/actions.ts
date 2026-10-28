@@ -834,7 +834,8 @@ export async function uninstallPlugin(
 // Activate / Deactivate — C1 fix: restore register in finally
 // ─────────────────────────────────────────────────────────────────────────────
 
-const activeFibers = new Map<string, { dispose?: () => unknown }>()
+type ActivePlugin = { fiber: { dispose?: () => unknown }; activePath: string }
+const activeFibers = new Map<string, ActivePlugin>()
 
 export async function activatePlugin(
   deps: ModuleDeps,
@@ -853,24 +854,38 @@ export async function activatePlugin(
     return { ok: false, error: 'host context does not expose ctx.plugin — dynamic mount unavailable' }
   }
 
-  const materialized = await materializeInstallTree(deps, id, record.files)
-  if (!materialized.ok) return { ok: false, error: materialized.error }
-  const installPath = materialized.installPath
-  const entryPath = join(installPath, 'lib/index.js')
+  const activePath = await mkdtemp(join(tmpdir(), 'dsh-forge-active-'))
   const digest = pluginContentDigest(record.files)
-  if (!digest) return { ok: false, error: 'record files are malformed' }
+  if (!digest) {
+    await rm(activePath, { recursive: true, force: true }).catch(() => {})
+    return { ok: false, error: 'record files are malformed' }
+  }
+  try {
+    for (const file of record.files) {
+      const target = containPath(activePath, file.path)
+      if (!target) throw new Error('unsafe file path: ' + file.path)
+      await mkdir(dirname(target), { recursive: true, mode: 0o700 })
+      await writeFile(target, file.content, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+    }
+  } catch (e) {
+    await rm(activePath, { recursive: true, force: true }).catch(() => {})
+    return { ok: false, error: 'could not materialize activation files: ' + (e instanceof Error ? e.message : String(e)) }
+  }
 
+  const entryPath = join(activePath, 'lib/index.js')
   let mod: { apply?: unknown }
   try {
-    // ESM caches imports by URL. A content query prevents re-activation from
-    // reusing stale code after the same record ID has been updated on disk.
-    const entryUrl = pathToFileURL(entryPath)
-    entryUrl.searchParams.set('sha256', digest)
-    mod = await import(entryUrl.href) as { apply?: unknown }
+    // A unique temp directory makes both the entry and its relative imports use
+    // fresh ESM URLs, avoiding stale child modules across activate/deactivate.
+    mod = await import(pathToFileURL(entryPath).href) as { apply?: unknown }
   } catch (e) {
+    await rm(activePath, { recursive: true, force: true }).catch(() => {})
     return { ok: false, error: 'dynamic import failed: ' + (e instanceof Error ? e.message : String(e)) }
   }
-  if (typeof mod.apply !== 'function') return { ok: false, error: 'module does not export an apply function' }
+  if (typeof mod.apply !== 'function') {
+    await rm(activePath, { recursive: true, force: true }).catch(() => {})
+    return { ok: false, error: 'module does not export an apply function' }
+  }
 
   const registered: string[] = []
   const originalRegister = ctx.tools.register
@@ -881,6 +896,7 @@ export async function activatePlugin(
   try {
     ctx.tools.register = patchedRegister as typeof ctx.tools.register
   } catch (e) {
+    await rm(activePath, { recursive: true, force: true }).catch(() => {})
     return { ok: false, error: 'host tool registry cannot be instrumented: ' + (e instanceof Error ? e.message : String(e)) }
   }
 
@@ -892,7 +908,7 @@ export async function activatePlugin(
       ? await mounted as { dispose?: () => unknown }
       : mounted as { dispose?: () => unknown } | undefined
     if (!fiber || typeof fiber !== 'object') throw new Error('mount produced no fiber')
-    activeFibers.set(id, fiber)
+    activeFibers.set(id, { fiber, activePath })
     const updated = await deps.store.update(id, {
       status: 'active',
       active: { mounted: true, toolNames: registered.slice(), at: new Date().toISOString() },
@@ -912,6 +928,7 @@ export async function activatePlugin(
   }
 
   if (mountError) {
+    await rm(activePath, { recursive: true, force: true }).catch(() => {})
     return { ok: false, error: 'mount failed: ' + mountError }
   }
   return { ok: true, toolNames: registered }
@@ -922,10 +939,10 @@ export async function deactivatePlugin(
   id: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   if (!/^[a-f0-9]{12}$/.test(id)) return { ok: false, error: 'invalid record ID' }
-  const fiber = activeFibers.get(id)
-  if (!fiber) return { ok: false, error: 'plugin is not active in this host' }
+  const active = activeFibers.get(id)
+  if (!active) return { ok: false, error: 'plugin is not active in this host' }
   try {
-    if (typeof fiber.dispose === 'function') await fiber.dispose()
+    if (typeof active.fiber.dispose === 'function') await active.fiber.dispose()
   } catch (e) {
     return { ok: false, error: 'plugin disposal failed: ' + (e instanceof Error ? e.message : String(e)) }
   }
@@ -936,12 +953,16 @@ export async function deactivatePlugin(
     : record?.test?.passed && digest && record.test.contentSha256 === digest ? 'tested'
       : record?.validation?.valid && digest && record.validation.contentSha256 === digest ? 'validated'
         : 'generated'
+  let cleanupError: string | undefined
+  try { await rm(active.activePath, { recursive: true, force: true }) }
+  catch (e) { cleanupError = e instanceof Error ? e.message : String(e) }
   try {
     const updated = await deps.store.update(id, { status, active: undefined })
     if (!updated) return { ok: false, error: 'plugin was disposed but forge state could not be updated' }
   } catch (e) {
     return { ok: false, error: 'plugin was disposed but forge state update failed: ' + (e instanceof Error ? e.message : String(e)) }
   }
+  if (cleanupError) return { ok: false, error: 'plugin was disposed but activation files could not be removed: ' + cleanupError }
   return { ok: true }
 }
 
