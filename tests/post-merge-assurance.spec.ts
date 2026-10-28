@@ -162,15 +162,16 @@ describe('post-merge hardening assurance', () => {
     let readyCount = 0
     while (Date.now() < readyDeadline) {
       const ready = await readFile(readyPath, 'utf8').catch(() => '')
-      readyCount = ready.trim() ? ready.trim().split(/\\r?\\n/).length : 0
+      readyCount = ready.trim() ? ready.trim().split(/\r?\n/).length : 0
       if (readyCount >= workerCount) break
       await new Promise(resolve => setTimeout(resolve, 10))
     }
-    expect(readyCount).toBe(workerCount)
+    // Release the barrier even if readiness timed out, so no child is left hanging.
     await writeFile(startPath, 'go')
     await Promise.all(childPromises)
+    expect(readyCount).toBe(workerCount)
 
-    const events = (await readFile(tracePath, 'utf8')).trim().split(/\\r?\\n/).map(line => line.split(' '))
+    const events = (await readFile(tracePath, 'utf8')).trim().split(/\r?\n/).map(line => line.split(' '))
     expect(events).toHaveLength(workerCount * 2)
     let activePid: string | null = null
     for (const [action, pid] of events) {
