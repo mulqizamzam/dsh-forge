@@ -160,6 +160,72 @@ describe('dsh-forge install gate', () => {
     if (!result.ok) expect(result.error).toMatch(/validation/i)
   })
 
+  it('retains a mounted Fiber after disposal fails so deactivation can retry', async () => {
+    const { activatePlugin, deactivatePlugin } = await import('../src/host/modules/forge/actions.ts')
+    const entry = `export function apply(ctx) {
+  ctx.tools.register({
+    name: 'active_smoke',
+    description: 'A valid tool used to test activation cleanup.',
+    parameters: { type: 'object', properties: {} },
+    output: { schema: { type: 'object' }, render: () => [] },
+    execute: async () => ({ ok: true }),
+  })
+}`
+    const files = [
+      { path: 'package.json', content: JSON.stringify({
+        name: 'active-smoke', version: '1.0.0', type: 'module',
+        main: 'lib/index.js', exports: { '.': './lib/index.js' },
+        dsh: { bundle: { patch: './cordis.patch.yml' }, engines: { dsh: '>=0.1.1-rc.1' } },
+      }) },
+      { path: 'cordis.patch.yml', content: '- insert:\n    - id: active-smoke\n      name: active-smoke\n      config: {}' },
+      { path: 'src/index.js', content: entry },
+      { path: 'lib/index.js', content: entry },
+    ]
+    const validation = validatePlugin(files)
+    expect(validation.valid).toBe(true)
+    const record = await store.add({ name: 'active-smoke', description: 'activation cleanup regression', files })
+    const digest = pluginContentDigest(files)!
+    const checkedAt = new Date().toISOString()
+    await store.update(record.id, {
+      validation: { ...validation, checkedAt, contentSha256: digest },
+      test: { passed: true, exitCode: 0, stdout: 'OK', stderr: '', durationMs: 1, checkedAt, contentSha256: digest },
+    })
+
+    const ctx = makeCtx()
+    let disposeCalls = 0
+    ctx.plugin = (module: unknown) => {
+      const pluginModule = module as { apply?: (host: HostContextShape, config: unknown) => unknown }
+      pluginModule.apply?.(ctx, {})
+      return {
+        state: 'ACTIVE',
+        inertia: Promise.resolve(),
+        dispose: () => {
+          disposeCalls++
+          if (disposeCalls === 1) throw new Error('transient dispose failure')
+        },
+      }
+    }
+    const deps = makeDeps(store)
+    deps.ctx = ctx
+    const originalUpdate = store.update.bind(store)
+    store.update = async (id, patch) => {
+      if (patch.status === 'active') return null
+      return originalUpdate(id, patch)
+    }
+
+    let activation: Awaited<ReturnType<typeof activatePlugin>>
+    try {
+      activation = await activatePlugin(deps, record.id)
+    } finally {
+      store.update = originalUpdate
+    }
+    const deactivation = await deactivatePlugin(deps, record.id)
+    expect(activation.ok).toBe(false)
+    if (!activation.ok) expect(activation.error).toMatch(/cleanup also failed/i)
+    expect(deactivation.ok).toBe(true)
+    expect(disposeCalls).toBe(2)
+  })
+
   it('buildSubmissionListing extracts capabilities from src/index.js', async () => {
     const { buildSubmissionListing } = await import('../src/host/modules/forge/actions.ts')
     const record = await store.add({
