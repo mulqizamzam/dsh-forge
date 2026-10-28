@@ -543,7 +543,7 @@ export async function testInSandbox(
   _deps: ModuleDeps,
   files: PluginFile[],
   timeoutMs: number,
-): Promise<ForgeRecord['test']> {
+): Promise<NonNullable<ForgeRecord['test']>> {
   const checkedAt = new Date().toISOString()
   const safetyError = validateSafeFileSet(files)
   if (safetyError) {
