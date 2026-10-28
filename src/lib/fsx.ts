@@ -1,4 +1,4 @@
-import { open, writeFile, readdir, lstat, unlink, mkdir, rename } from 'node:fs/promises'
+import { open, readdir, lstat, unlink, mkdir, rename } from 'node:fs/promises'
 import { constants as fsConstants } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { newId } from './ids.ts'
