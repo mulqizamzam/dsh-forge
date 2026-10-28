@@ -30,7 +30,7 @@ export function apply(deps: ModuleDeps): void {
   }
   if (failures.length > 0) {
     deps.warn('forge: ' + failures.length + '/' + tools.length + ' tool registrations failed: ' + failures.join(' | '))
-    throw new Error('forge tool registration incomplete (' + registered + '/' + tools.length + ' registered'))
+    throw new Error('forge tool registration incomplete (' + registered + '/' + tools.length + ' registered)')
   }
   deps.log('forge: registered ' + registered + ' tools')
 }
