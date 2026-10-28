@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { existsSync } from 'node:fs'
 import { mkdtemp, rm, writeFile, readFile, appendFile, readdir } from 'node:fs/promises'
-import { join, delimiter } from 'node:path'
+import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import { hostname, tmpdir } from 'node:os'
