@@ -94,5 +94,8 @@ function unwrapVolatile(value: unknown): unknown {
 }
 
 export function resolveConfig(raw: unknown): ResolvedConfig {
-  return Config(unwrapVolatile(raw) as Parameters<typeof Config>[0]) as ResolvedConfig
+  // Schemastery may materialize .volatile() fields as references while applying
+  // defaults. Unwrap both the loader-provided config and the parsed result.
+  const parsed = Config(unwrapVolatile(raw) as Parameters<typeof Config>[0])
+  return unwrapVolatile(parsed) as ResolvedConfig
 }
