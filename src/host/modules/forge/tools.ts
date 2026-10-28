@@ -196,7 +196,7 @@ export function forgeTools(deps: ModuleDeps): ToolDefinition[] {
         type: 'object',
         properties: {
           id: { type: 'string', description: 'Record ID.' },
-          outPath: { type: 'string', description: 'Optional absolute output path for the .tgz archive.' },
+          outPath: { type: 'string', description: 'Optional absolute path for the .tgz archive; must be a direct child of the forge exports directory.' },
         },
         required: ['id'],
       },
