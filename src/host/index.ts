@@ -30,8 +30,11 @@ function errorMessage(e: unknown): string {
 }
 
 interface Logger { info: (m: string) => void; warn: (m: string) => void }
-function makeLogger(_prefix: string): Logger {
-  return { info: () => {}, warn: () => {} }
+function makeLogger(prefix: string): Logger {
+  return {
+    info: (message: string) => console.info('[dsh-forge:' + prefix + '] ' + message),
+    warn: (message: string) => console.warn('[dsh-forge:' + prefix + '] ' + message),
+  }
 }
 
 export async function apply(rawContext: unknown, rawConfig: Partial<ForgeConfig> = {}): Promise<void> {
@@ -135,10 +138,16 @@ async function boot(
     warn: (m: string) => log.warn(m),
   }
 
+  const failedModules: string[] = []
   for (const module of MODULES) {
     try { module.apply(deps) } catch (e) {
-      log.warn('module "' + module.name + '" failed: ' + errorMessage(e))
+      const message = 'module "' + module.name + '" failed: ' + errorMessage(e)
+      log.warn(message)
+      failedModules.push(module.name)
     }
+  }
+  if (failedModules.length > 0) {
+    throw new Error('module registration incomplete: ' + failedModules.join(', '))
   }
 }
 
