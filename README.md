@@ -82,7 +82,7 @@ Example plugin configuration:
 ```yaml
 - id: dsh-forge
   config:
-    stateRoot: "" # Empty uses $DSH_HOME/dsh-forge/<profile>
+    stateRoot: "" # Empty uses $DSH_HOME/dsh-forge/<profile>; restart after changing
     forge:
       defaultProfile: web
       sandbox:
@@ -94,6 +94,8 @@ Example plugin configuration:
       activation:
         allowInProcessExecution: false
 ```
+
+On DSH 0.1.7 and newer, the host builds the plugin's settings form from the exported `Config` schema. Live-editable fields are marked `.volatile()` in the schema and read dynamically by Forge; the plugin does not call the removed `ctx.settings.register()` API. `stateRoot` is intentionally not volatile because the store opens its root once at startup. Set it in the profile's configuration layer and restart DSH after changing it.
 
 Keep both install gates enabled. Setting either `requireValidated` or `requireTested` to `false` permits code to be installed or activated without that check.
 
