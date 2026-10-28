@@ -37,6 +37,7 @@ export interface ForgeRecord {
     errors: string[]
     warnings: string[]
     checkedAt: string
+    contentSha256?: string
   }
   test?: {
     passed: boolean
@@ -45,6 +46,7 @@ export interface ForgeRecord {
     stderr: string
     durationMs: number
     checkedAt: string
+    contentSha256?: string
   }
   install?: {
     installed: boolean
