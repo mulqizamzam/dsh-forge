@@ -646,7 +646,7 @@ describe('cross-process lock hardening', () => {
       })
     })
     await Promise.all([runWorker(), runWorker()])
-    const events = (await readFile(tracePath, 'utf8')).trim().split(/\\r?\\n/).map(line => line.split(' '))
+    const events = (await readFile(tracePath, 'utf8')).trim().split(/\r?\n/).map(line => line.split(' '))
     expect(events.map(event => event[0])).toEqual(['enter', 'exit', 'enter', 'exit'])
     expect(events[0]?.[1]).toBe(events[1]?.[1])
     expect(events[2]?.[1]).toBe(events[3]?.[1])
