@@ -37,6 +37,8 @@ DSH plugin contract (authoritative):
   [{ id: <name>, name: <name>, config: {} }]
 - src/index.js and lib/index.js MUST both export an async apply(ctx, config) function
   that registers at least one tool via ctx.tools.register({ name, description, parameters, output, execute }).
+- Each registered tool MUST have a unique identifier name, a non-empty description, a parameters JSON Schema with type "object",
+  an output object containing a JSON Schema in "schema" and a callable "render", and a callable "execute".
 - lib/index.js is the runtime entry and MUST contain the same executable ESM implementation as src/index.js.
 - package.json main MUST be "lib/index.js" and exports["."] MUST be "./lib/index.js".
 - No TypeScript build step is permitted. Files must be plain .js ESM.
