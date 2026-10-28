@@ -888,7 +888,7 @@ export async function uninstallPlugin(
 // Activate / Deactivate — C1 fix: restore register in finally
 // ─────────────────────────────────────────────────────────────────────────────
 
-type ActivePlugin = { fiber: { dispose?: () => unknown; state?: unknown; inertia?: Promise<unknown> }; activePath: string }
+type ActivePlugin = { fiber: { dispose?: () => unknown; state?: unknown; inertia?: Promise<unknown> }; activePath: string; disposed?: boolean }
 const activeFibers = new Map<string, ActivePlugin>()
 
 export async function activatePlugin(
@@ -975,11 +975,21 @@ export async function activatePlugin(
     if (!updated) throw new Error('mount succeeded but forge state could not be updated')
   } catch (e) {
     mountError = e instanceof Error ? e.message : String(e)
-    activeFibers.delete(id)
-    if (fiber && typeof fiber.dispose === 'function') {
-      try { await fiber.dispose() } catch (disposeError) {
+    if (!fiber) {
+      activeFibers.delete(id)
+    } else if (typeof fiber.dispose === 'function') {
+      try {
+        await fiber.dispose()
+        activeFibers.delete(id)
+      } catch (disposeError) {
+        // Keep the fiber and its activation tree tracked so forge_deactivate can retry.
+        activeFibers.set(id, { fiber, activePath })
         mountError += '; cleanup also failed: ' + (disposeError instanceof Error ? disposeError.message : String(disposeError))
       }
+    } else {
+      // A fiber without dispose() cannot be cleaned safely; never discard its tracking.
+      activeFibers.set(id, { fiber, activePath })
+      mountError += '; Fiber exposes no dispose() method, so activation remains tracked for recovery'
     }
   } finally {
     // Restore the exact original function reference even when mounting fails.
@@ -987,7 +997,9 @@ export async function activatePlugin(
   }
 
   if (mountError) {
-    await rm(activePath, { recursive: true, force: true }).catch(() => {})
+    if (!activeFibers.has(id)) {
+      await rm(activePath, { recursive: true, force: true }).catch(() => {})
+    }
     return { ok: false, error: 'mount failed: ' + mountError }
   }
   return { ok: true, toolNames: registered }
@@ -1000,28 +1012,35 @@ export async function deactivatePlugin(
   if (!/^[a-f0-9]{12}$/.test(id)) return { ok: false, error: 'invalid record ID' }
   const active = activeFibers.get(id)
   if (!active) return { ok: false, error: 'plugin is not active in this host' }
-  try {
-    if (typeof active.fiber.dispose === 'function') await active.fiber.dispose()
-  } catch (e) {
-    return { ok: false, error: 'plugin disposal failed: ' + (e instanceof Error ? e.message : String(e)) }
+  if (!active.disposed) {
+    if (typeof active.fiber.dispose !== 'function') {
+      return { ok: false, error: 'active plugin Fiber does not expose dispose(); tracking is retained because it cannot be safely unmounted' }
+    }
+    try {
+      await active.fiber.dispose()
+      active.disposed = true
+    } catch (e) {
+      return { ok: false, error: 'plugin disposal failed: ' + (e instanceof Error ? e.message : String(e)) }
+    }
   }
-  activeFibers.delete(id)
+  // Keep a retryable state until filesystem cleanup and persistent state update both succeed.
+  try { await rm(active.activePath, { recursive: true, force: true }) }
+  catch (e) {
+    return { ok: false, error: 'plugin was disposed but activation files could not be removed; tracking retained for retry: ' + (e instanceof Error ? e.message : String(e)) }
+  }
   const record = await deps.store.get(id)
   const digest = record ? pluginContentDigest(record.files) : null
   const status = record?.install?.installed ? 'installed'
     : record?.test?.passed && digest && record.test.contentSha256 === digest ? 'tested'
       : record?.validation?.valid && digest && record.validation.contentSha256 === digest ? 'validated'
         : 'generated'
-  let cleanupError: string | undefined
-  try { await rm(active.activePath, { recursive: true, force: true }) }
-  catch (e) { cleanupError = e instanceof Error ? e.message : String(e) }
   try {
     const updated = await deps.store.update(id, { status, active: undefined })
-    if (!updated) return { ok: false, error: 'plugin was disposed but forge state could not be updated' }
+    if (!updated) return { ok: false, error: 'plugin was disposed but forge state could not be updated; tracking retained for retry' }
   } catch (e) {
-    return { ok: false, error: 'plugin was disposed but forge state update failed: ' + (e instanceof Error ? e.message : String(e)) }
+    return { ok: false, error: 'plugin was disposed but forge state update failed; tracking retained for retry: ' + (e instanceof Error ? e.message : String(e)) }
   }
-  if (cleanupError) return { ok: false, error: 'plugin was disposed but activation files could not be removed: ' + cleanupError }
+  activeFibers.delete(id)
   return { ok: true }
 }
 
