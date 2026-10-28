@@ -896,6 +896,23 @@ const activeFibers = new Map<string, ActivePlugin>()
 // before any I/O and is released on every return/throw path.
 const lifecycleOperations = new Set<string>()
 
+// ctx.tools.register belongs to the shared host, not to an individual plugin.
+// Only one activation may instrument it at a time, including across record IDs.
+let activationQueue: Promise<void> = Promise.resolve()
+
+async function withActivationQueue<T>(action: () => Promise<T>): Promise<T> {
+  const previous = activationQueue
+  let release!: () => void
+  const current = new Promise<void>(resolve => { release = resolve })
+  activationQueue = current
+  await previous
+  try {
+    return await action()
+  } finally {
+    release()
+  }
+}
+
 async function withLifecycleOperation<T extends { ok: boolean }>(
   id: string,
   action: () => Promise<T>,
@@ -1087,7 +1104,7 @@ export function activatePlugin(
   deps: ModuleDeps,
   id: string,
 ): Promise<{ ok: true; toolNames: string[] } | { ok: false; error: string }> {
-  return withLifecycleOperation(id, () => activatePluginUnlocked(deps, id))
+  return withLifecycleOperation(id, () => withActivationQueue(() => activatePluginUnlocked(deps, id)))
 }
 
 export function deactivatePlugin(
