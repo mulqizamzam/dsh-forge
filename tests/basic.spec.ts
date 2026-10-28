@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { ForgeStore } from '../src/host/store.ts'
 import { resolveConfig } from '../src/host/config.ts'
 import { forgeTools } from '../src/host/modules/forge/tools.ts'
-import { validatePlugin, testInSandbox, pluginContentDigest } from '../src/host/modules/forge/actions.ts'
+import { validatePlugin, testInSandbox, pluginContentDigest, validateRuntimeToolDefinition } from '../src/host/modules/forge/actions.ts'
 import type { ModuleDeps } from '../src/host/types.ts'
 import type { HostContextShape } from '../src/host/dsh.ts'
 
@@ -260,13 +260,52 @@ describe('hardening regressions', () => {
   })
 })
 
+describe('runtime tool contract hardening', () => {
+  const validTool = {
+    name: 'tool_smoke',
+    description: 'A minimal valid DSH tool.',
+    parameters: { type: 'object', properties: {} },
+    output: { schema: { type: 'object' }, render: () => [] },
+    execute: async () => ({ ok: true }),
+  }
+
+  it('accepts a complete runtime tool definition', () => {
+    expect(validateRuntimeToolDefinition(validTool)).toEqual({ valid: true, name: 'tool_smoke' })
+  })
+
+  it('rejects name-only registrations that used to make the sandbox pass', () => {
+    const result = validateRuntimeToolDefinition({ name: 'looks-valid' })
+    expect(result.valid).toBe(false)
+    if (!result.valid) expect(result.error).toMatch(/description|parameters|output|execute/i)
+  })
+
+  it('rejects malformed schemas, missing execute handlers, and invalid names', () => {
+    expect(validateRuntimeToolDefinition({ ...validTool, parameters: [] }).valid).toBe(false)
+    expect(validateRuntimeToolDefinition({ ...validTool, execute: undefined }).valid).toBe(false)
+    expect(validateRuntimeToolDefinition({ ...validTool, name: 'bad tool name' }).valid).toBe(false)
+  })
+})
+
 describe('runtime sandbox', () => {
   it('runs the runtime entry inside an isolated bubblewrap filesystem', async () => {
-    const entry = `import { existsSync } from 'node:fs'
+    const entry = `import { existsSync, writeFileSync } from 'node:fs'
 export async function apply(ctx) {
   if (existsSync('/home')) throw new Error('host home directory is visible in sandbox')
   if (process.env.DSH_HOME) throw new Error('host DSH_HOME leaked into sandbox')
-  ctx.tools.register({ name: 'sandbox-smoke' })
+  try {
+    writeFileSync('.sandbox-write-probe', 'must not write')
+    throw new Error('plugin source tree is writable in sandbox')
+  } catch (error) {
+    if (error && error.message === 'plugin source tree is writable in sandbox') throw error
+    if (!error || !['EROFS', 'EACCES'].includes(error.code)) throw error
+  }
+  ctx.tools.register({
+    name: 'sandbox-smoke',
+    description: 'Validate sandbox isolation and registration shape.',
+    parameters: { type: 'object', properties: {} },
+    output: { schema: { type: 'object' }, render: () => [] },
+    execute: async () => ({ ok: true }),
+  })
 }`
     const files = [
       { path: 'package.json', content: '{"name":"sandbox-smoke","type":"module","main":"lib/index.js"}' },
@@ -282,7 +321,7 @@ export async function apply(ctx) {
       expect(result.passed).toBe(false)
       return
     }
-    expect(result.stdout).toContain('OK_TOOLS:sandbox-smoke')
+    expect(result.stdout.trimEnd().split(/\\r?\\n/).slice(-1)[0]).toBe('FORGE_SANDBOX_RESULT:OK:sandbox-smoke')
   })
 
 })
