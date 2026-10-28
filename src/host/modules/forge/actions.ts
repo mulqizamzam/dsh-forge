@@ -691,7 +691,7 @@ console.log('FORGE_SANDBOX_RESULT:OK:' + registered.join(','))
     )
 
     const r = await spawnProcess('bwrap', bwrapArgs, { timeoutMs })
-    const lastOutputLine = r.stdout.trimEnd().split(/\\r?\\n/).slice(-1)[0] ?? ''
+    const lastOutputLine = r.stdout.trimEnd().split(/\r?\n/).slice(-1)[0] ?? ''
     return {
       passed: r.exitCode === 0 && lastOutputLine.startsWith('FORGE_SANDBOX_RESULT:OK:'),
       exitCode: r.exitCode,
