@@ -961,6 +961,7 @@ export async function activatePlugin(
     // Fiber itself: that can accidentally wait for the entire plugin lifetime.
     fiber = ctx.plugin(mod, {}) as typeof fiber
     if (!fiber || typeof fiber !== 'object') throw new Error('mount produced no fiber')
+    if (typeof fiber.dispose !== 'function') throw new Error('plugin Fiber does not expose dispose(); activation cannot be safely managed')
     // Wait only for an in-flight load transition when the host exposes it.
     if (fiber.inertia && typeof (fiber.inertia as { then?: unknown }).then === 'function') {
       await fiber.inertia
