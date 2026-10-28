@@ -3,9 +3,9 @@
 // retry on empty output), fail-closed static validation, sandboxed test
 // (process-group timeout), gated install, activation, export, submission.
 
-import { join, dirname, resolve, isAbsolute } from 'node:path'
+import { join, dirname, resolve, isAbsolute, relative } from 'node:path'
 import { createHash } from 'node:crypto'
-import { mkdir, writeFile, rm, mkdtemp, access } from 'node:fs/promises'
+import { mkdir, writeFile, rm, mkdtemp, access, lstat } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
@@ -679,41 +679,108 @@ export async function generatePlugin(
 // Install — GATED on validate + test
 // ─────────────────────────────────────────────────────────────────────────────
 
+async function materializeInstallTree(
+  deps: ModuleDeps,
+  id: string,
+  files: PluginFile[],
+): Promise<{ ok: true; installPath: string } | { ok: false; error: string }> {
+  if (!/^[a-f0-9]{12}$/.test(id)) return { ok: false, error: 'invalid record ID' }
+  const safetyError = validateSafeFileSet(files)
+  if (safetyError) return { ok: false, error: safetyError }
+  const root = resolve(deps.store.getRoot())
+  const rootStat = await lstat(root).catch(() => null)
+  if (!rootStat || !rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    return { ok: false, error: 'forge state root is missing or is not a real directory' }
+  }
+  const installedRoot = join(root, 'installed')
+  try {
+    await mkdir(installedRoot, { recursive: true, mode: 0o700 })
+    const installedStat = await lstat(installedRoot)
+    if (!installedStat.isDirectory() || installedStat.isSymbolicLink()) {
+      return { ok: false, error: 'installed state path must be a real directory, not a symlink' }
+    }
+    const installPath = containPath(installedRoot, id)
+    if (!installPath) return { ok: false, error: 'invalid install destination' }
+    await rm(installPath, { recursive: true, force: true })
+    await mkdir(installPath, { mode: 0o700 })
+    for (const file of files) {
+      const target = containPath(installPath, file.path)
+      if (!target) throw new Error('unsafe file path: ' + file.path)
+      await mkdir(dirname(target), { recursive: true, mode: 0o700 })
+      await writeFile(target, file.content, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+    }
+    return { ok: true, installPath }
+  } catch (e) {
+    const installPath = join(installedRoot, id)
+    await rm(installPath, { recursive: true, force: true }).catch(() => {})
+    return { ok: false, error: 'could not materialize plugin files: ' + (e instanceof Error ? e.message : String(e)) }
+  }
+}
+
+function freshEvidenceError(
+  record: ForgeRecord,
+  options: { requireValidation: boolean; requireTest: boolean },
+): string | null {
+  const digest = pluginContentDigest(record.files)
+  if (!digest) return 'record files are malformed; generate the plugin again'
+  if (options.requireValidation) {
+    if (record.validation?.valid !== true || record.validation.contentSha256 !== digest) {
+      return 'static validation evidence is missing or stale; rerun forge_validate'
+    }
+    const current = validatePlugin(record.files)
+    if (!current.valid) return 'current plugin contents fail validation: ' + current.errors.slice(0, 5).join('; ')
+  }
+  if (options.requireTest && (record.test?.passed !== true || record.test.contentSha256 !== digest)) {
+    return 'sandbox test evidence is missing or stale; rerun forge_test'
+  }
+  return null
+}
+
+function hasDshLoadFailure(output: string): boolean {
+  return /failed to import|did not activate|ERR_MODULE_NOT_FOUND|plugin activation failed/i.test(output)
+}
+
 export async function installPlugin(
   deps: ModuleDeps,
   id: string,
   profile?: string,
 ): Promise<{ ok: true; installPath: string; profile: string } | { ok: false; error: string }> {
   const record = await deps.store.get(id)
-  if (!record) return { ok: false, error: 'record not found: ' + id }
+  if (!record) return { ok: false, error: 'record not found or invalid record ID: ' + id }
+  if (activeFibers.has(id)) return { ok: false, error: 'deactivate the plugin before reinstalling it' }
+  if (record.install?.installed) return { ok: false, error: 'plugin is already installed; uninstall it before reinstalling' }
   const cfg = deps.cfg().forge
-  if (cfg.install.requireValidated && !record.validation?.valid) {
-    return { ok: false, error: 'refusing to install: static validation must pass first (run forge_validate)' }
-  }
-  if (cfg.install.requireTested && !record.test?.passed) {
-    return { ok: false, error: 'refusing to install: sandbox test must pass first (run forge_test)' }
-  }
+  const safetyError = validateSafeFileSet(record.files)
+  if (safetyError) return { ok: false, error: safetyError }
+  const evidenceError = freshEvidenceError(record, {
+    requireValidation: cfg.install.requireValidated,
+    requireTest: cfg.install.requireTested,
+  })
+  if (evidenceError) return { ok: false, error: 'refusing to install: ' + evidenceError }
   const chosenProfile = profile || cfg.defaultProfile
   if (!/^[a-zA-Z0-9_-]{1,64}$/.test(chosenProfile)) {
     return { ok: false, error: 'invalid DSH profile name; use letters, digits, underscore, or hyphen (max 64 chars)' }
   }
-  const installPath = join(deps.store.getRoot(), 'installed', id)
-  await rm(installPath, { recursive: true, force: true }).catch(() => { /* ignore */ })
-  for (const f of record.files) {
-    const target = containPath(installPath, f.path)
-    if (target === null) return { ok: false, error: 'unsafe file path: ' + f.path }
-    await mkdir(dirname(target), { recursive: true })
-    await writeFile(target, f.content, 'utf8')
+  try {
+    const materialized = await materializeInstallTree(deps, id, record.files)
+    if (!materialized.ok) return { ok: false, error: materialized.error }
+    const r = await spawnProcess('dsh', ['plugin', '--profile', chosenProfile, 'add', materialized.installPath], { timeoutMs: 60_000 })
+    const output = (r.stdout + '\n' + r.stderr).trim()
+    if (r.exitCode !== 0 || hasDshLoadFailure(output)) {
+      return {
+        ok: false,
+        error: 'dsh plugin add did not complete cleanly (exit ' + String(r.exitCode) + '): ' + (output || 'no diagnostic output').slice(0, 1000),
+      }
+    }
+    const updated = await deps.store.update(id, {
+      status: 'installed',
+      install: { installed: true, profile: chosenProfile, installPath: materialized.installPath, at: new Date().toISOString() },
+    })
+    if (!updated) return { ok: false, error: 'plugin was added but forge state could not be updated; inspect the DSH profile before retrying' }
+    return { ok: true, installPath: materialized.installPath, profile: chosenProfile }
+  } catch (e) {
+    return { ok: false, error: 'install failed: ' + (e instanceof Error ? e.message : String(e)) }
   }
-  const r = await spawnProcess('dsh', ['plugin', '--profile', chosenProfile, 'add', installPath], { timeoutMs: 60_000 })
-  if (r.exitCode !== 0) {
-    return { ok: false, error: 'dsh plugin add failed (exit ' + String(r.exitCode) + '): ' + r.stderr.slice(0, 500) }
-  }
-  await deps.store.update(id, {
-    status: 'installed',
-    install: { installed: true, profile: chosenProfile, installPath, at: new Date().toISOString() },
-  })
-  return { ok: true, installPath, profile: chosenProfile }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -725,9 +792,13 @@ export async function uninstallPlugin(
   id: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const record = await deps.store.get(id)
-  if (!record) return { ok: false, error: 'record not found: ' + id }
+  if (!record) return { ok: false, error: 'record not found or invalid record ID: ' + id }
+  if (activeFibers.has(id)) return { ok: false, error: 'deactivate the plugin before uninstalling it' }
   if (!record.install?.installed) return { ok: false, error: 'plugin is not installed' }
   const profile = record.install.profile
+  if (typeof profile !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(profile)) {
+    return { ok: false, error: 'record contains an invalid installed profile; refusing to run dsh' }
+  }
   let pkgName = record.name
   const pkg = record.files.find(f => f.path === 'package.json')
   if (pkg) {
@@ -736,13 +807,27 @@ export async function uninstallPlugin(
       if (typeof p.name === 'string' && p.name !== '') pkgName = p.name
     } catch { /* keep record.name */ }
   }
-  const r = await spawnProcess('dsh', ['plugin', '--profile', profile, 'remove', pkgName], { timeoutMs: 60_000 })
-  if (r.exitCode !== 0) {
-    return { ok: false, error: 'dsh plugin remove failed (exit ' + String(r.exitCode) + '): ' + r.stderr.slice(0, 500) }
+  if (!/^[a-z0-9][a-z0-9._-]{0,99}$/.test(pkgName)) {
+    return { ok: false, error: 'record contains an invalid package name; refusing to run dsh' }
   }
-  // L2 fix — restore previous status (tested), not 'installed'.
-  await deps.store.update(id, { status: 'tested', install: undefined })
-  return { ok: true }
+  try {
+    const r = await spawnProcess('dsh', ['plugin', '--profile', profile, 'remove', pkgName], { timeoutMs: 60_000 })
+    const output = (r.stdout + '\n' + r.stderr).trim()
+    if (r.exitCode !== 0 || /failed to remove|could not remove|not found/i.test(output)) {
+      return { ok: false, error: 'dsh plugin remove did not complete cleanly (exit ' + String(r.exitCode) + '): ' + (output || 'no diagnostic output').slice(0, 1000) }
+    }
+    const digest = pluginContentDigest(record.files)
+    const status = record.test?.passed && digest && record.test.contentSha256 === digest
+      ? 'tested'
+      : record.validation?.valid && digest && record.validation.contentSha256 === digest
+        ? 'validated'
+        : 'generated'
+    const updated = await deps.store.update(id, { status, install: undefined, active: undefined })
+    if (!updated) return { ok: false, error: 'plugin was removed but forge state could not be updated' }
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, error: 'uninstall failed: ' + (e instanceof Error ? e.message : String(e)) }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
