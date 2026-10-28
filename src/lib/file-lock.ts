@@ -1,4 +1,4 @@
-import { open, lstat, readFile, rename, unlink } from 'node:fs/promises'
+import { open, lstat, readFile, rename, unlink, link } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { dirname, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -131,43 +131,56 @@ export async function withFileLock<T>(
 
   let acquired = false
   while (!acquired) {
+    // Write a complete owner record before publishing the lock name. Contenders
+    // never observe an empty/partially-written lock that could be mistaken for
+    // an abandoned owner during a long scheduler pause.
+    const initializingPath = lockPath + '.init-' + randomUUID()
     let handle: Awaited<ReturnType<typeof open>> | undefined
-    let created = false
     try {
-      handle = await open(lockPath, 'wx', 0o600)
-      created = true
+      handle = await open(initializingPath, 'wx', 0o600)
       await handle.writeFile(JSON.stringify(owner), 'utf8')
       await handle.sync()
-      acquired = true
-    } catch (error) {
-      if (created) {
-        await unlink(lockPath).catch(() => {})
-        throw error
+      await handle.close()
+      handle = undefined
+      try {
+        // Hard-link creation fails atomically if another owner already published
+        // the canonical lock path. Both files are in the same directory/filesystem.
+        await link(initializingPath, lockPath)
+        acquired = true
+      } catch (error) {
+        if (errorCode(error) !== 'EEXIST') throw error
       }
-      if (errorCode(error) !== 'EEXIST') throw error
-
-      if (await lockIsStale(lockPath, staleInitializingMs)) {
-        const retired = lockPath + '.stale-' + randomUUID()
-        try {
-          await rename(lockPath, retired)
-          await unlink(retired).catch(() => {})
-          continue
-        } catch (renameError) {
-          const code = errorCode(renameError)
-          if (code === 'ENOENT' || code === 'EEXIST' || code === 'ENOTEMPTY') continue
-          throw renameError
-        }
-      }
-      if (Date.now() >= deadline) {
-        throw new Error('timed out waiting for cross-process lock: ' + lockPath)
-      }
-      await new Promise<void>(resolveDelay => setTimeout(resolveDelay, 50))
     } finally {
       await handle?.close().catch(() => {})
+      await unlink(initializingPath).catch(() => {})
     }
+
+    if (acquired) break
+    if (await lockIsStale(lockPath, staleInitializingMs)) {
+      const retired = lockPath + '.stale-' + randomUUID()
+      try {
+        await rename(lockPath, retired)
+        await unlink(retired).catch(() => {})
+        continue
+      } catch (renameError) {
+        const code = errorCode(renameError)
+        if (code === 'ENOENT' || code === 'EEXIST' || code === 'ENOTEMPTY') continue
+        throw renameError
+      }
+    }
+    if (Date.now() >= deadline) {
+      throw new Error('timed out waiting for cross-process lock: ' + lockPath)
+    }
+    await new Promise<void>(resolveDelay => setTimeout(resolveDelay, 50))
   }
 
   try {
+    return await action()
+  } finally {
+    const current = await readLockOwner(lockPath)
+    if (current?.token === token) await unlink(lockPath).catch(() => {})
+  }
+}  try {
     return await action()
   } finally {
     const current = await readLockOwner(lockPath)

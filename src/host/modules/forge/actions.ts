@@ -5,7 +5,7 @@
 
 import { join, dirname, resolve, isAbsolute } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, writeFile, rm, mkdtemp, access, lstat } from 'node:fs/promises'
+import { mkdir, writeFile, rm, mkdtemp, access, lstat, rename } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
@@ -783,6 +783,7 @@ async function materializeInstallTree(
     return { ok: false, error: 'forge state root is missing or is not a real directory' }
   }
   const installedRoot = join(root, 'installed')
+  let stagedPath: string | undefined
   try {
     await mkdir(installedRoot, { recursive: true, mode: 0o700 })
     const installedStat = await lstat(installedRoot)
@@ -791,19 +792,35 @@ async function materializeInstallTree(
     }
     const installPath = containPath(installedRoot, id)
     if (!installPath) return { ok: false, error: 'invalid install destination' }
-    await rm(installPath, { recursive: true, force: true })
-    await mkdir(installPath, { mode: 0o700 })
+    const existing = await lstat(installPath).catch(() => null)
+    if (existing) {
+      if (!existing.isDirectory() || existing.isSymbolicLink()) {
+        return { ok: false, error: 'install destination already exists and is not a real directory; refusing to overwrite it' }
+      }
+      return { ok: false, error: 'install destination already exists; inspect the prior operation and reconcile/clean it before retrying' }
+    }
+
+    stagedPath = join(installedRoot, '.' + id + '.stage-' + randomUUID())
+    await mkdir(stagedPath, { mode: 0o700 })
     for (const file of files) {
-      const target = containPath(installPath, file.path)
+      const target = containPath(stagedPath, file.path)
       if (!target) throw new Error('unsafe file path: ' + file.path)
       await mkdir(dirname(target), { recursive: true, mode: 0o700 })
       await writeFile(target, file.content, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
     }
+    // The stage is a complete tree before it becomes the install path. The
+    // parent is private and lifecycle/profile locks serialize cooperating writers.
+    const destinationNow = await lstat(installPath).catch(() => null)
+    if (destinationNow) {
+      return { ok: false, error: 'install destination appeared during materialization; refusing to replace it' }
+    }
+    await rename(stagedPath, installPath)
+    stagedPath = undefined
     return { ok: true, installPath }
   } catch (e) {
-    const installPath = join(installedRoot, id)
-    await rm(installPath, { recursive: true, force: true }).catch(() => {})
     return { ok: false, error: 'could not materialize plugin files: ' + (e instanceof Error ? e.message : String(e)) }
+  } finally {
+    if (stagedPath) await rm(stagedPath, { recursive: true, force: true }).catch(() => {})
   }
 }
 
