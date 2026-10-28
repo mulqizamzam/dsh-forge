@@ -9,6 +9,19 @@ export type ForgeStatus =
   | 'installed'
   | 'active'
   | 'failed'
+  | 'installing'
+  | 'uninstalling'
+  | 'recovery_required'
+
+export interface ForgeOperation {
+  kind: 'install' | 'uninstall'
+  phase: 'prepared' | 'external_succeeded'
+  profile: string
+  packageName: string
+  installPath: string
+  startedAt: string
+  updatedAt: string
+}
 
 export interface PluginFile {
   path: string
@@ -64,6 +77,8 @@ export interface ForgeRecord {
     outputTokens: number
     totalTokens: number
   }
+  /** Journal for an external DSH profile mutation that may need manual reconciliation. */
+  operation?: ForgeOperation
 }
 
 export interface ModuleDeps {

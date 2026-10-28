@@ -1,12 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, rm, writeFile, readFile, mkdir, chmod, symlink, readdir } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile, readFile, appendFile, mkdir, chmod, symlink, readdir } from 'node:fs/promises'
 import { join, delimiter } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { ForgeStore } from '../src/host/store.ts'
 import { readJsonSafe, writeJsonAtomic } from '../src/lib/fsx.ts'
 import { resolveConfig } from '../src/host/config.ts'
 import { forgeTools } from '../src/host/modules/forge/tools.ts'
-import { validatePlugin, testInSandbox, pluginContentDigest, validateRuntimeToolDefinition, installPlugin, activatePlugin, deactivatePlugin, exportPlugin } from '../src/host/modules/forge/actions.ts'
+import { validatePlugin, testInSandbox, pluginContentDigest, validateRuntimeToolDefinition, installPlugin, activatePlugin, deactivatePlugin, exportPlugin, reconcilePluginOperation } from '../src/host/modules/forge/actions.ts'
 import type { ModuleDeps } from '../src/host/types.ts'
 import type { HostContextShape } from '../src/host/dsh.ts'
 
@@ -24,6 +26,51 @@ function makeDeps(store: ForgeStore): ModuleDeps {
   return { ctx: makeCtx(), cfg: () => resolveConfig({}), store, log: () => {}, warn: () => {} }
 }
 
+function makeActivationEnabledDeps(store: ForgeStore): ModuleDeps {
+  const deps = makeDeps(store)
+  const config = resolveConfig({})
+  config.forge.activation.allowInProcessExecution = true
+  deps.cfg = () => config
+  return deps
+}
+
+function buildValidPluginFiles(name: string): Array<{ path: string; content: string }> {
+  const toolName = name.replace(/-/g, '_') + '_smoke'
+  const entry = `export function apply(ctx) {
+  ctx.tools.register({
+    name: '${toolName}',
+    description: 'A valid self-contained plugin for hardening regression tests.',
+    parameters: { type: 'object', properties: {} },
+    output: { schema: { type: 'object' }, render: () => [] },
+    execute: async () => ({ ok: true }),
+  })
+}`
+  return [
+    { path: 'package.json', content: JSON.stringify({
+      name, version: '1.0.0', type: 'module',
+      main: 'lib/index.js', exports: { '.': './lib/index.js' },
+      dsh: { bundle: { patch: './cordis.patch.yml' }, engines: { dsh: '>=0.1.1-rc.1' } },
+    }) },
+    { path: 'cordis.patch.yml', content: `- insert:\n    - id: ${name}\n      name: ${name}\n      config: {}` },
+    { path: 'src/index.js', content: entry },
+    { path: 'lib/index.js', content: entry },
+  ]
+}
+
+async function addValidatedTestedRecord(store: ForgeStore, name: string) {
+  const files = buildValidPluginFiles(name)
+  const validation = validatePlugin(files)
+  if (!validation.valid) throw new Error('test fixture invalid: ' + validation.errors.join('; '))
+  const record = await store.add({ name, description: 'validated regression fixture', files })
+  const digest = pluginContentDigest(files)!
+  const checkedAt = new Date().toISOString()
+  await store.update(record.id, {
+    validation: { ...validation, checkedAt, contentSha256: digest },
+    test: { passed: true, exitCode: 0, stdout: 'OK', stderr: '', durationMs: 1, checkedAt, contentSha256: digest },
+  })
+  return record
+}
+
 describe('dsh-forge smoke', () => {
   let root: string
   let store: ForgeStore
@@ -36,9 +83,9 @@ describe('dsh-forge smoke', () => {
 
   afterEach(async () => { await rm(root, { recursive: true, force: true }) })
 
-  it('registers 10 forge action tools', () => {
+  it('registers 11 forge action tools', () => {
     const tools = forgeTools(makeDeps(store))
-    expect(tools.length).toBe(10)
+    expect(tools.length).toBe(11)
     const names = tools.map(t => t.name).sort()
     expect(names).toEqual([
       'forge_activate',
@@ -47,6 +94,7 @@ describe('dsh-forge smoke', () => {
       'forge_export',
       'forge_generate',
       'forge_install',
+      'forge_reconcile',
       'forge_submit',
       'forge_test',
       'forge_uninstall',
@@ -145,6 +193,77 @@ describe('dsh-forge install gate', () => {
   })
   afterEach(async () => { await rm(root, { recursive: true, force: true }) })
 
+  it('prevents two Forge records from installing the same package into one profile', async () => {
+    const first = await addValidatedTestedRecord(store, 'same-package')
+    const secondFiles = buildValidPluginFiles('same-package')
+    const second = await store.add({ name: 'different-record-name', description: 'duplicate package identity', files: secondFiles })
+    const secondValidation = validatePlugin(secondFiles)
+    expect(secondValidation.valid).toBe(true)
+    const secondDigest = pluginContentDigest(secondFiles)!
+    const checkedAt = new Date().toISOString()
+    await store.update(second.id, {
+      validation: { ...secondValidation, checkedAt, contentSha256: secondDigest },
+      test: { passed: true, exitCode: 0, stdout: 'OK', stderr: '', durationMs: 1, checkedAt, contentSha256: secondDigest },
+    })
+
+    const fakeBin = join(root, 'fake-dsh-bin')
+    await mkdir(fakeBin)
+    const callLog = join(root, 'dsh-calls.log')
+    await writeFile(join(fakeBin, 'dsh'), '#!/bin/sh\necho called >> "$FORGE_TEST_DSH_CALL_LOG"\nexit 0\n')
+    await chmod(join(fakeBin, 'dsh'), 0o700)
+    const priorPath = process.env.PATH
+    const priorLog = process.env.FORGE_TEST_DSH_CALL_LOG
+    try {
+      process.env.PATH = [fakeBin, priorPath].filter((part): part is string => !!part).join(delimiter)
+      process.env.FORGE_TEST_DSH_CALL_LOG = callLog
+      const installed = await installPlugin(makeDeps(store), first.id, 'web')
+      expect(installed.ok).toBe(true)
+      const duplicate = await installPlugin(makeDeps(store), second.id, 'web')
+      expect(duplicate.ok).toBe(false)
+      if (!duplicate.ok) expect(duplicate.error).toMatch(/already installed|unfinished operation/i)
+    } finally {
+      if (priorPath === undefined) delete process.env.PATH
+      else process.env.PATH = priorPath
+      if (priorLog === undefined) delete process.env.FORGE_TEST_DSH_CALL_LOG
+      else process.env.FORGE_TEST_DSH_CALL_LOG = priorLog
+    }
+    expect((await readFile(callLog, 'utf8')).trim().split(/\r?\n/)).toHaveLength(1)
+    expect((await store.get(first.id))?.install?.installed).toBe(true)
+    expect((await store.get(second.id))?.install?.installed).not.toBe(true)
+  })
+
+  it('refuses to overwrite an existing install tree before invoking DSH', async () => {
+    const record = await addValidatedTestedRecord(store, 'existing-install-tree')
+    const installPath = join(root, 'installed', record.id)
+    await mkdir(installPath, { recursive: true })
+    const sentinelPath = join(installPath, 'operator-owned.txt')
+    await writeFile(sentinelPath, 'must survive')
+
+    const fakeBin = join(root, 'fake-dsh-bin')
+    await mkdir(fakeBin)
+    const callLog = join(root, 'dsh-calls.log')
+    await writeFile(join(fakeBin, 'dsh'), '#!/bin/sh\necho called >> "$FORGE_TEST_DSH_CALL_LOG"\nexit 0\n')
+    await chmod(join(fakeBin, 'dsh'), 0o700)
+    const priorPath = process.env.PATH
+    const priorLog = process.env.FORGE_TEST_DSH_CALL_LOG
+    let result: Awaited<ReturnType<typeof installPlugin>>
+    try {
+      process.env.PATH = [fakeBin, priorPath].filter((part): part is string => !!part).join(delimiter)
+      process.env.FORGE_TEST_DSH_CALL_LOG = callLog
+      result = await installPlugin(makeDeps(store), record.id, 'web')
+    } finally {
+      if (priorPath === undefined) delete process.env.PATH
+      else process.env.PATH = priorPath
+      if (priorLog === undefined) delete process.env.FORGE_TEST_DSH_CALL_LOG
+      else process.env.FORGE_TEST_DSH_CALL_LOG = priorLog
+    }
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toMatch(/install destination already exists/i)
+    expect(await readFile(sentinelPath, 'utf8')).toBe('must survive')
+    await expect(readFile(callLog, 'utf8')).rejects.toThrow()
+    expect((await store.get(record.id))?.operation).toBeUndefined()
+  })
+
   it('install refuses without validation', async () => {
     const record = await store.add({ name: 'test', description: 'd', files: [] })
     const { installPlugin } = await import('../src/host/modules/forge/actions.ts')
@@ -159,6 +278,76 @@ describe('dsh-forge install gate', () => {
     const result = await activatePlugin(makeDeps(store), record.id)
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.error).toMatch(/validation/i)
+  })
+
+  it('completes a mocked install activate deactivate uninstall lifecycle', async () => {
+    const record = await addValidatedTestedRecord(store, 'lifecycle-e2e')
+    const ctx = makeCtx()
+    let disposed = 0
+    ctx.plugin = (module: unknown) => {
+      const pluginModule = module as { apply?: (host: HostContextShape, config: unknown) => unknown }
+      pluginModule.apply?.(ctx, {})
+      return { state: 'ACTIVE', inertia: Promise.resolve(), dispose: () => { disposed++ } }
+    }
+    const deps = makeActivationEnabledDeps(store)
+    deps.ctx = ctx
+    const fakeBin = join(root, 'fake-dsh-bin')
+    await mkdir(fakeBin)
+    const callLog = join(root, 'dsh-calls.log')
+    await writeFile(join(fakeBin, 'dsh'), '#!/bin/sh\necho "$@" >> "$FORGE_TEST_DSH_CALL_LOG"\nexit 0\n')
+    await chmod(join(fakeBin, 'dsh'), 0o700)
+    const oldPath = process.env.PATH
+    const oldLog = process.env.FORGE_TEST_DSH_CALL_LOG
+    try {
+      process.env.PATH = [fakeBin, oldPath].filter((part): part is string => !!part).join(delimiter)
+      process.env.FORGE_TEST_DSH_CALL_LOG = callLog
+      expect((await installPlugin(deps, record.id, 'web')).ok).toBe(true)
+      expect((await activatePlugin(deps, record.id)).ok).toBe(true)
+      expect((await deactivatePlugin(deps, record.id)).ok).toBe(true)
+      const { uninstallPlugin } = await import('../src/host/modules/forge/actions.ts')
+      expect((await uninstallPlugin(deps, record.id)).ok).toBe(true)
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH
+      else process.env.PATH = oldPath
+      if (oldLog === undefined) delete process.env.FORGE_TEST_DSH_CALL_LOG
+      else process.env.FORGE_TEST_DSH_CALL_LOG = oldLog
+    }
+    const finalRecord = await store.get(record.id)
+    expect(finalRecord?.install).toBeUndefined()
+    expect(finalRecord?.active).toBeUndefined()
+    expect(finalRecord?.operation).toBeUndefined()
+    expect(finalRecord?.status).toBe('tested')
+    expect(disposed).toBe(1)
+    expect(await readdir(join(root, 'installed'))).not.toContain(record.id)
+    const calls = (await readFile(callLog, 'utf8')).trim().split(/\r?\n/)
+    expect(calls).toHaveLength(2)
+    expect(calls[0]).toContain('add')
+    expect(calls[1]).toContain('remove')
+  })
+
+  it('disables in-process activation until explicitly opted in', async () => {
+    const record = await addValidatedTestedRecord(store, 'activation-opt-in')
+    const deps = makeDeps(store)
+    let mountCalls = 0
+    deps.ctx.plugin = (module: unknown) => {
+      mountCalls++
+      const pluginModule = module as { apply?: (host: HostContextShape, config: unknown) => unknown }
+      pluginModule.apply?.(deps.ctx, {})
+      return { state: 'ACTIVE', inertia: Promise.resolve(), dispose: () => {} }
+    }
+
+    const blocked = await activatePlugin(deps, record.id)
+    expect(blocked.ok).toBe(false)
+    if (!blocked.ok) expect(blocked.error).toMatch(/disabled by default/i)
+    expect(mountCalls).toBe(0)
+
+    const enabled = makeActivationEnabledDeps(store)
+    enabled.ctx = deps.ctx
+    const activated = await activatePlugin(enabled, record.id)
+    expect(activated.ok).toBe(true)
+    expect(mountCalls).toBe(1)
+    const deactivated = await deactivatePlugin(enabled, record.id)
+    expect(deactivated.ok).toBe(true)
   })
 
   it('retains a mounted Fiber after disposal fails so deactivation can retry', async () => {
@@ -206,7 +395,7 @@ describe('dsh-forge install gate', () => {
         },
       }
     }
-    const deps = makeDeps(store)
+    const deps = makeActivationEnabledDeps(store)
     deps.ctx = ctx
     const originalUpdate = store.update.bind(store)
     store.update = async (id, patch) => {
@@ -269,6 +458,27 @@ describe('path and package hardening', () => {
     expect(result.valid).toBe(false)
     expect(result.errors.join(' ')).toMatch(/duplicate file path/i)
     expect(result.errors.join(' ')).toMatch(/sensitive|vendor/i)
+  })
+
+  it('rejects install lifecycle scripts and external package dependencies', () => {
+    const entry = 'export function apply(ctx) { ctx.tools.register({ name: "t" }) }'
+    const base = {
+      name: 'self-contained', version: '1.0.0', type: 'module',
+      main: 'lib/index.js', exports: { '.': './lib/index.js' },
+      dsh: { bundle: { patch: './cordis.patch.yml' }, engines: { dsh: '>=0.1.1-rc.1' } },
+    }
+    const filesFor = (pkg: Record<string, unknown>) => [
+      { path: 'package.json', content: JSON.stringify(pkg) },
+      { path: 'cordis.patch.yml', content: '- insert:\\n    - id: self-contained\\n      name: self-contained\\n      config: {}' },
+      { path: 'src/index.js', content: entry },
+      { path: 'lib/index.js', content: entry },
+    ]
+    const withScript = validatePlugin(filesFor({ ...base, scripts: { prepare: 'node install.js' } }))
+    expect(withScript.valid).toBe(false)
+    expect(withScript.errors.join(' ')).toMatch(/scripts are not permitted/i)
+    const withDependency = validatePlugin(filesFor({ ...base, dependencies: { 'untrusted-runtime': '*' } }))
+    expect(withDependency.valid).toBe(false)
+    expect(withDependency.errors.join(' ')).toMatch(/dependencies are not permitted/i)
   })
 
   it('requires package main entry and registry identity to match', () => {
@@ -496,6 +706,26 @@ describe('lifecycle and persisted-state hardening', () => {
   })
   afterEach(async () => { await rm(root, { recursive: true, force: true }) })
 
+  it('rejects a malformed persisted external-operation journal', async () => {
+    const record = await store.add({ name: 'x', description: 'd', files: [] })
+    const recordPath = join(root, 'records', record.id + '.json')
+    const malformed = {
+      ...record,
+      status: 'recovery_required',
+      operation: {
+        kind: 'install',
+        phase: 'unknown_phase',
+        profile: 'web',
+        packageName: 'x',
+        installPath: join(root, 'installed', record.id),
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+    }
+    await writeFile(recordPath, JSON.stringify(malformed))
+    expect(await store.get(record.id)).toBeNull()
+  })
+
   it('rejects records with malformed nested validation state', async () => {
     const record = await store.add({ name: 'x', description: 'd', files: [] })
     const recordPath = join(root, 'records', record.id + '.json')
@@ -583,7 +813,7 @@ describe('lifecycle and persisted-state hardening', () => {
         dispose: () => {},
       }
     }
-    const deps = makeDeps(store)
+    const deps = makeActivationEnabledDeps(store)
     deps.ctx = ctx
 
     const firstActivation = activatePlugin(deps, record.id)
@@ -606,5 +836,199 @@ describe('lifecycle and persisted-state hardening', () => {
     expect(mountCount).toBe(2)
     const deactivation = await deactivatePlugin(deps, record.id)
     expect(deactivation.ok).toBe(true)
+  })
+})
+
+describe('cross-process lock hardening', () => {
+  let root: string
+  beforeEach(async () => { root = await mkdtemp(join(tmpdir(), 'forge-lock-')) })
+  afterEach(async () => { await rm(root, { recursive: true, force: true }) })
+
+  it('serializes two independent Node processes and reclaims a provably dead owner', async () => {
+    const lockPath = join(root, 'shared.lock')
+    const tracePath = join(root, 'trace.log')
+    const lockModule = pathToFileURL(join(process.cwd(), 'src/lib/file-lock.ts')).href
+    const workerSource = `
+      import { appendFile } from 'node:fs/promises'
+      const { withFileLock } = await import(${JSON.stringify(lockModule)})
+      const lockPath = process.env.FORGE_TEST_LOCK_PATH
+      const tracePath = process.env.FORGE_TEST_TRACE_PATH
+      if (!lockPath || !tracePath) throw new Error('test environment missing paths')
+      await withFileLock(lockPath, async () => {
+        await appendFile(tracePath, 'enter ' + String(process.pid) + ' ' + String(Date.now()) + '\\n')
+        await new Promise(resolve => setTimeout(resolve, 160))
+        await appendFile(tracePath, 'exit ' + String(process.pid) + ' ' + String(Date.now()) + '\\n')
+      }, { timeoutMs: 8000 })
+    `
+    const runWorker = () => new Promise<void>((resolve, reject) => {
+      const child = spawn(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e', workerSource], {
+        env: { ...process.env, FORGE_TEST_LOCK_PATH: lockPath, FORGE_TEST_TRACE_PATH: tracePath },
+        stdio: ['ignore', 'ignore', 'pipe'],
+      })
+      let stderr = ''
+      child.stderr.on('data', chunk => { stderr += String(chunk).slice(0, 4000) })
+      child.once('error', reject)
+      child.once('close', code => {
+        if (code === 0) resolve()
+        else reject(new Error('lock worker failed (' + String(code) + '): ' + stderr))
+      })
+    })
+    await Promise.all([runWorker(), runWorker()])
+    const events = (await readFile(tracePath, 'utf8')).trim().split(/\r?\n/).map(line => line.split(' '))
+    expect(events.map(event => event[0])).toEqual(['enter', 'exit', 'enter', 'exit'])
+    expect(events[0]?.[1]).toBe(events[1]?.[1])
+    expect(events[2]?.[1]).toBe(events[3]?.[1])
+    expect(events[0]?.[1]).not.toBe(events[2]?.[1])
+
+    // Model a crashed process. The lock is reclaimable only because its PID is
+    // provably absent on this same host; remote-host locks are deliberately not stolen.
+    const deadPid = 999_999_999
+    await writeFile(lockPath, JSON.stringify({
+      token: 'dead-owner-token-123456789',
+      pid: deadPid,
+      host: (await import('node:os')).hostname(),
+      createdAt: Date.now() - 60_000,
+    }))
+    let ran = false
+    const { withFileLock } = await import('../src/lib/file-lock.ts')
+    await withFileLock(lockPath, async () => { ran = true }, { timeoutMs: 2000 })
+    expect(ran).toBe(true)
+  })
+
+  it('does not steal an old lock owned by another host', async () => {
+    const lockPath = join(root, 'remote-owner.lock')
+    const ownerToken = 'remote-owner-token-abcdefghijkl'
+    const { hostname } = await import('node:os')
+    await writeFile(lockPath, JSON.stringify({
+      token: ownerToken,
+      pid: process.pid,
+      host: hostname() + '-different-host',
+      createdAt: Date.now() - 60_000,
+    }))
+    let ran = false
+    const { withFileLock } = await import('../src/lib/file-lock.ts')
+    await expect(withFileLock(lockPath, async () => { ran = true }, { timeoutMs: 100 }))
+      .rejects.toThrow(/timed out waiting for cross-process lock/i)
+    expect(ran).toBe(false)
+    expect(JSON.parse(await readFile(lockPath, 'utf8')).token).toBe(ownerToken)
+  })
+})
+
+describe('external DSH operation recovery', () => {
+  let root: string
+  let store: ForgeStore
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'forge-recovery-'))
+    store = new ForgeStore({ root })
+    await store.init()
+  })
+  afterEach(async () => { await rm(root, { recursive: true, force: true }) })
+
+  it('journals an ambiguous install failure and reconciles from observed DSH state', async () => {
+    const record = await addValidatedTestedRecord(store, 'install-journal')
+    const fakeBin = join(root, 'fake-dsh-bin')
+    await mkdir(fakeBin)
+    await writeFile(join(fakeBin, 'dsh'), '#!/bin/sh\necho simulated_failure >&2\nexit 19\n')
+    await chmod(join(fakeBin, 'dsh'), 0o700)
+
+    const priorPath = process.env.PATH
+    let result: Awaited<ReturnType<typeof installPlugin>>
+    try {
+      process.env.PATH = [fakeBin, priorPath].filter((part): part is string => !!part).join(delimiter)
+      result = await installPlugin(makeDeps(store), record.id, 'web')
+    } finally {
+      if (priorPath === undefined) delete process.env.PATH
+      else process.env.PATH = priorPath
+    }
+
+    expect(result.ok).toBe(false)
+    const journaled = await store.get(record.id)
+    expect(journaled?.status).toBe('recovery_required')
+    expect(journaled?.operation?.kind).toBe('install')
+    expect(journaled?.operation?.phase).toBe('prepared')
+
+    const reconciled = await reconcilePluginOperation(makeDeps(store), record.id, false)
+    expect(reconciled.ok).toBe(true)
+    const finalRecord = await store.get(record.id)
+    expect(finalRecord?.operation).toBeUndefined()
+    expect(finalRecord?.install).toBeUndefined()
+    expect(finalRecord?.status).toBe('tested')
+    await expect(readFile(join(root, 'installed', record.id, 'package.json'), 'utf8')).rejects.toThrow()
+  })
+
+  it('reconciles an external install that succeeded when the final Forge write fails', async () => {
+    const record = await addValidatedTestedRecord(store, 'install-commit-failure')
+    const fakeBin = join(root, 'fake-dsh-bin')
+    await mkdir(fakeBin)
+    await writeFile(join(fakeBin, 'dsh'), '#!/bin/sh\necho simulated_success\nexit 0\n')
+    await chmod(join(fakeBin, 'dsh'), 0o700)
+
+    const priorPath = process.env.PATH
+    const originalUpdate = store.update.bind(store)
+    let result: Awaited<ReturnType<typeof installPlugin>>
+    store.update = async (id, patch) => {
+      if (patch.status === 'installed' && patch.install?.installed === true) return null
+      return originalUpdate(id, patch)
+    }
+    try {
+      process.env.PATH = [fakeBin, priorPath].filter((part): part is string => !!part).join(delimiter)
+      result = await installPlugin(makeDeps(store), record.id, 'web')
+    } finally {
+      store.update = originalUpdate
+      if (priorPath === undefined) delete process.env.PATH
+      else process.env.PATH = priorPath
+    }
+
+    expect(result.ok).toBe(false)
+    const journaled = await store.get(record.id)
+    expect(journaled?.status).toBe('recovery_required')
+    expect(journaled?.operation?.phase).toBe('external_succeeded')
+
+    const reconciled = await reconcilePluginOperation(makeDeps(store), record.id, true)
+    expect(reconciled.ok).toBe(true)
+    const finalRecord = await store.get(record.id)
+    expect(finalRecord?.status).toBe('installed')
+    expect(finalRecord?.install?.installed).toBe(true)
+    expect(finalRecord?.operation).toBeUndefined()
+    expect(await readFile(join(root, 'installed', record.id, 'lib/index.js'), 'utf8')).toContain('export function apply')
+  })
+
+  it('keeps an uninstall journal when DSH fails and preserves the observed installed state', async () => {
+    const record = await addValidatedTestedRecord(store, 'uninstall-journal')
+    const installPath = join(root, 'installed', record.id)
+    await mkdir(join(installPath, 'lib'), { recursive: true })
+    await writeFile(join(installPath, 'package.json'), record.files.find(file => file.path === 'package.json')!.content)
+    await writeFile(join(installPath, 'lib/index.js'), record.files.find(file => file.path === 'lib/index.js')!.content)
+    await store.update(record.id, {
+      status: 'installed',
+      install: { installed: true, profile: 'web', installPath, at: new Date().toISOString() },
+    })
+    const fakeBin = join(root, 'fake-dsh-bin')
+    await mkdir(fakeBin)
+    await writeFile(join(fakeBin, 'dsh'), '#!/bin/sh\necho simulated_remove_failure >&2\nexit 19\n')
+    await chmod(join(fakeBin, 'dsh'), 0o700)
+
+    const priorPath = process.env.PATH
+    let result: Awaited<ReturnType<typeof installPlugin>>
+    try {
+      process.env.PATH = [fakeBin, priorPath].filter((part): part is string => !!part).join(delimiter)
+      const { uninstallPlugin } = await import('../src/host/modules/forge/actions.ts')
+      result = await uninstallPlugin(makeDeps(store), record.id)
+    } finally {
+      if (priorPath === undefined) delete process.env.PATH
+      else process.env.PATH = priorPath
+    }
+    expect(result.ok).toBe(false)
+    const journaled = await store.get(record.id)
+    expect(journaled?.status).toBe('recovery_required')
+    expect(journaled?.operation?.kind).toBe('uninstall')
+
+    const reconciled = await reconcilePluginOperation(makeDeps(store), record.id, true)
+    expect(reconciled.ok).toBe(true)
+    const finalRecord = await store.get(record.id)
+    expect(finalRecord?.status).toBe('installed')
+    expect(finalRecord?.install?.installed).toBe(true)
+    expect(finalRecord?.operation).toBeUndefined()
   })
 })

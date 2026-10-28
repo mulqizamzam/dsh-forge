@@ -13,6 +13,7 @@ import {
   uninstallPlugin,
   validatePlugin,
   pluginContentDigest,
+  reconcilePluginOperation,
 } from './actions.ts'
 
 const RENDER = (_args: Record<string, unknown>, value: never): Array<{ type: 'text'; text: string }> => text(value)
@@ -158,8 +159,30 @@ export function forgeTools(deps: ModuleDeps): ToolDefinition[] {
     } as never),
 
     defineTool({
+      name: 'forge_reconcile',
+      description: 'Resolve an interrupted install/uninstall journal only after you inspect the actual DSH profile. Set observedInstalled=true if the package is present, otherwise false. This does not query DSH automatically and never guesses external state.',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Record ID with an unfinished lifecycle operation.' },
+          observedInstalled: { type: 'boolean', description: 'Actual package presence in the profile named in the journal; inspect DSH first.' },
+        },
+        required: ['id', 'observedInstalled'],
+      },
+      output: { schema: JSON_OBJECT_OUTPUT, render: RENDER },
+      execute: async (args: never) => {
+        const a = (args ?? {}) as Record<string, unknown>
+        const id = typeof a.id === 'string' ? a.id : ''
+        if (typeof a.observedInstalled !== 'boolean') {
+          return neutralizeDeep({ ok: false, error: 'observedInstalled must be a boolean; inspect the real DSH profile first' })
+        }
+        return neutralizeDeep(await reconcilePluginOperation(deps, id, a.observedInstalled))
+      },
+    } as never),
+
+    defineTool({
       name: 'forge_activate',
-      description: 'Mount a validated + tested plugin into the currently-running host via ctx.plugin. Requires forge_validate and forge_test to have passed. Unmount with forge_deactivate.',
+      description: 'Execute a validated + tested plugin inside the current DSH host process via ctx.plugin. This runs candidate code with host-process privileges and is disabled unless forge.activation.allowInProcessExecution=true is explicitly configured. Unmount with forge_deactivate.',
       parameters: {
         type: 'object',
         properties: { id: { type: 'string', description: 'Record ID.' } },

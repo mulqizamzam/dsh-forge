@@ -5,12 +5,12 @@
 
 import { join, dirname, resolve, isAbsolute } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, writeFile, rm, mkdtemp, access, lstat } from 'node:fs/promises'
+import { mkdir, writeFile, rm, mkdtemp, access, lstat, rename } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
 import { containPath } from '../../../lib/contain.ts'
-import type { ForgeRecord, ModuleDeps, PluginFile, DiscoveryCandidate } from '../../types.ts'
+import type { ForgeRecord, ForgeOperation, ModuleDeps, PluginFile, DiscoveryCandidate } from '../../types.ts'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LLM call — retry once on empty output (reference parity, H2 fix)
@@ -42,6 +42,8 @@ DSH plugin contract (authoritative):
 - lib/index.js is the runtime entry and MUST contain the same executable ESM implementation as src/index.js.
 - package.json main MUST be "lib/index.js" and exports["."] MUST be "./lib/index.js".
 - No TypeScript build step is permitted. Files must be plain .js ESM.
+- Plugin packages MUST be self-contained: do not declare package.json scripts or dependencies/optionalDependencies/devDependencies/peerDependencies.
+  Install lifecycle scripts and dependency postinstall hooks run outside forge_test's sandbox and are not permitted.
 
 Rules:
 - All content values are JSON strings; escape quotes and newlines correctly.
@@ -247,6 +249,29 @@ function validateSafeFileSet(filesInput: unknown): string | null {
     if (totalBytes > MAX_PLUGIN_BYTES) return 'plugin exceeds 5 MiB total content limit'
     if (paths.some((other, j) => j !== i && other.startsWith(key + '/'))) return 'file path conflicts with a directory path: ' + file.path
   }
+  const packageFile = files.find(file => file.path === 'package.json')
+  if (packageFile) {
+    let manifest: Record<string, unknown>
+    try {
+      manifest = JSON.parse(packageFile.content) as Record<string, unknown>
+      if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) return 'package.json root must be an object'
+    } catch {
+      return 'package.json is not valid JSON'
+    }
+    if (manifest.scripts !== undefined) {
+      if (!manifest.scripts || typeof manifest.scripts !== 'object' || Array.isArray(manifest.scripts) ||
+          Object.keys(manifest.scripts as Record<string, unknown>).length > 0) {
+        return 'package.json scripts are not permitted; package lifecycle scripts execute outside the sandbox'
+      }
+    }
+    for (const field of ['dependencies', 'optionalDependencies', 'devDependencies', 'peerDependencies', 'bundledDependencies']) {
+      const value = manifest[field]
+      if (value !== undefined && (!value || typeof value !== 'object' || Array.isArray(value) ||
+          Object.keys(value as Record<string, unknown>).length > 0)) {
+        return 'package.json ' + field + ' are not permitted; generated plugins must be self-contained'
+      }
+    }
+  }
   return null
 }
 
@@ -361,6 +386,19 @@ export function validatePlugin(filesInput: unknown): { valid: boolean; errors: s
         errors.push('package.json: "name" must be a lowercase package slug (1–100 chars)')
       } else packageName = p.name
       if (p.type !== 'module') errors.push('package.json: "type" must be "module" for ESM plugin entries')
+      if (p.scripts !== undefined) {
+        if (!p.scripts || typeof p.scripts !== 'object' || Array.isArray(p.scripts) ||
+            Object.keys(p.scripts as Record<string, unknown>).length > 0) {
+          errors.push('package.json scripts are not permitted; package lifecycle scripts execute outside the sandbox')
+        }
+      }
+      for (const field of ['dependencies', 'optionalDependencies', 'devDependencies', 'peerDependencies', 'bundledDependencies']) {
+        const value = p[field]
+        if (value !== undefined && (!value || typeof value !== 'object' || Array.isArray(value) ||
+            Object.keys(value as Record<string, unknown>).length > 0)) {
+          errors.push('package.json ' + field + ' are not permitted; generated plugins must be self-contained')
+        }
+      }
       if (typeof p.version !== 'string' || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(p.version)) {
         errors.push('package.json: "version" must be valid semver')
       }
@@ -745,6 +783,7 @@ async function materializeInstallTree(
     return { ok: false, error: 'forge state root is missing or is not a real directory' }
   }
   const installedRoot = join(root, 'installed')
+  let stagedPath: string | undefined
   try {
     await mkdir(installedRoot, { recursive: true, mode: 0o700 })
     const installedStat = await lstat(installedRoot)
@@ -753,20 +792,54 @@ async function materializeInstallTree(
     }
     const installPath = containPath(installedRoot, id)
     if (!installPath) return { ok: false, error: 'invalid install destination' }
-    await rm(installPath, { recursive: true, force: true })
-    await mkdir(installPath, { mode: 0o700 })
+    const existing = await lstat(installPath).catch(() => null)
+    if (existing) {
+      if (!existing.isDirectory() || existing.isSymbolicLink()) {
+        return { ok: false, error: 'install destination already exists and is not a real directory; refusing to overwrite it' }
+      }
+      return { ok: false, error: 'install destination already exists; inspect the prior operation and reconcile/clean it before retrying' }
+    }
+
+    stagedPath = join(installedRoot, '.' + id + '.stage-' + randomUUID())
+    await mkdir(stagedPath, { mode: 0o700 })
     for (const file of files) {
-      const target = containPath(installPath, file.path)
+      const target = containPath(stagedPath, file.path)
       if (!target) throw new Error('unsafe file path: ' + file.path)
       await mkdir(dirname(target), { recursive: true, mode: 0o700 })
       await writeFile(target, file.content, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
     }
+    // The stage is a complete tree before it becomes the install path. The
+    // parent is private and lifecycle/profile locks serialize cooperating writers.
+    const destinationNow = await lstat(installPath).catch(() => null)
+    if (destinationNow) {
+      return { ok: false, error: 'install destination appeared during materialization; refusing to replace it' }
+    }
+    await rename(stagedPath, installPath)
+    stagedPath = undefined
     return { ok: true, installPath }
   } catch (e) {
-    const installPath = join(installedRoot, id)
-    await rm(installPath, { recursive: true, force: true }).catch(() => {})
     return { ok: false, error: 'could not materialize plugin files: ' + (e instanceof Error ? e.message : String(e)) }
+  } finally {
+    if (stagedPath) await rm(stagedPath, { recursive: true, force: true }).catch(() => {})
   }
+}
+
+function packageNameFor(record: ForgeRecord): string {
+  const pkg = record.files.find(file => file.path === 'package.json')
+  if (pkg) {
+    try {
+      const parsed = JSON.parse(pkg.content) as Record<string, unknown>
+      if (typeof parsed.name === 'string') return parsed.name
+    } catch { /* rejected by safety gate when malformed */ }
+  }
+  return record.name
+}
+
+function statusAfterUninstall(record: ForgeRecord): ForgeRecord['status'] {
+  const digest = pluginContentDigest(record.files)
+  if (record.test?.passed && digest && record.test.contentSha256 === digest) return 'tested'
+  if (record.validation?.valid && digest && record.validation.contentSha256 === digest) return 'validated'
+  return 'generated'
 }
 
 function freshEvidenceError(
@@ -801,9 +874,8 @@ async function installPluginUnlocked(
   if (!record) return { ok: false, error: 'record not found or invalid record ID: ' + id }
   if (activeFibers.has(id)) return { ok: false, error: 'deactivate the plugin before reinstalling it' }
   if (record.install?.installed) return { ok: false, error: 'plugin is already installed; uninstall it before reinstalling' }
+  if (record.operation) return { ok: false, error: 'record has an unfinished external operation; run forge_reconcile after checking the DSH profile' }
   const cfg = deps.cfg().forge
-  // Check explicit gates first so callers get the actionable missing-validation
-  // message even when an untouched draft has no files yet.
   const evidenceError = freshEvidenceError(record, {
     requireValidation: cfg.install.requireValidated,
     requireTest: cfg.install.requireTested,
@@ -815,25 +887,74 @@ async function installPluginUnlocked(
   if (!/^[a-zA-Z0-9_-]{1,64}$/.test(chosenProfile)) {
     return { ok: false, error: 'invalid DSH profile name; use letters, digits, underscore, or hyphen (max 64 chars)' }
   }
+  const packageName = packageNameFor(record)
+  if (!/^[a-z0-9][a-z0-9._-]{0,99}$/.test(packageName)) {
+    return { ok: false, error: 'record contains an invalid package name; refusing to run dsh' }
+  }
+  const conflict = await deps.store.findProfilePackageConflict(chosenProfile, packageName, id)
+  if (conflict.error) return { ok: false, error: conflict.error }
+  if (conflict.conflictId) {
+    return {
+      ok: false,
+      error: 'package ' + packageName + ' is already installed or has an unfinished operation in profile ' + chosenProfile + ' (record ' + conflict.conflictId + ')',
+    }
+  }
+  let operation: ForgeOperation | undefined
   try {
     const materialized = await materializeInstallTree(deps, id, record.files)
     if (!materialized.ok) return { ok: false, error: materialized.error }
+    const startedAt = new Date().toISOString()
+    operation = {
+      kind: 'install',
+      phase: 'prepared',
+      profile: chosenProfile,
+      packageName,
+      installPath: materialized.installPath,
+      startedAt,
+      updatedAt: startedAt,
+    }
+    const journaled = await deps.store.update(id, { status: 'installing', operation })
+    if (!journaled) return { ok: false, error: 'could not persist install journal; DSH was not invoked' }
+
     const r = await spawnProcess('dsh', ['plugin', '--profile', chosenProfile, 'add', materialized.installPath], { timeoutMs: 60_000 })
     const output = (r.stdout + '\n' + r.stderr).trim()
     if (r.exitCode !== 0 || hasDshLoadFailure(output)) {
+      operation = { ...operation, updatedAt: new Date().toISOString() }
+      await deps.store.update(id, { status: 'recovery_required', operation }).catch(() => null)
       return {
         ok: false,
-        error: 'dsh plugin add did not complete cleanly (exit ' + String(r.exitCode) + '): ' + (output || 'no diagnostic output').slice(0, 1000),
+        error: 'dsh plugin add did not complete cleanly (exit ' + String(r.exitCode) + '): ' +
+          (output || 'no diagnostic output').slice(0, 700) +
+          '; inspect the profile and run forge_reconcile with observedInstalled set to the actual DSH state',
       }
     }
+
+    operation = { ...operation, phase: 'external_succeeded', updatedAt: new Date().toISOString() }
+    const externalSuccess = await deps.store.update(id, { status: 'installing', operation })
+    if (!externalSuccess) {
+      return { ok: false, error: 'DSH install succeeded but the journal phase could not be saved; inspect the profile and run forge_reconcile' }
+    }
+    const installedAt = new Date().toISOString()
     const updated = await deps.store.update(id, {
       status: 'installed',
-      install: { installed: true, profile: chosenProfile, installPath: materialized.installPath, at: new Date().toISOString() },
+      install: { installed: true, profile: chosenProfile, installPath: materialized.installPath, at: installedAt },
+      operation: undefined,
     })
-    if (!updated) return { ok: false, error: 'plugin was added but forge state could not be updated; inspect the DSH profile before retrying' }
+    if (!updated) {
+      await deps.store.update(id, { status: 'recovery_required', operation }).catch(() => null)
+      return { ok: false, error: 'plugin was added but Forge state could not be committed; inspect the profile and run forge_reconcile' }
+    }
     return { ok: true, installPath: materialized.installPath, profile: chosenProfile }
   } catch (e) {
-    return { ok: false, error: 'install failed: ' + (e instanceof Error ? e.message : String(e)) }
+    if (operation) {
+      operation = { ...operation, updatedAt: new Date().toISOString() }
+      await deps.store.update(id, { status: 'recovery_required', operation }).catch(() => null)
+    }
+    return {
+      ok: false,
+      error: (operation ? 'install outcome may require reconciliation: ' : 'install failed: ') +
+        (e instanceof Error ? e.message : String(e)),
+    }
   }
 }
 
@@ -849,38 +970,85 @@ async function uninstallPluginUnlocked(
   if (!record) return { ok: false, error: 'record not found or invalid record ID: ' + id }
   if (activeFibers.has(id)) return { ok: false, error: 'deactivate the plugin before uninstalling it' }
   if (!record.install?.installed) return { ok: false, error: 'plugin is not installed' }
+  if (record.operation) return { ok: false, error: 'record has an unfinished external operation; run forge_reconcile after checking the DSH profile' }
   const profile = record.install.profile
   if (typeof profile !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(profile)) {
     return { ok: false, error: 'record contains an invalid installed profile; refusing to run dsh' }
   }
-  let pkgName = record.name
-  const pkg = record.files.find(f => f.path === 'package.json')
-  if (pkg) {
-    try {
-      const p = JSON.parse(pkg.content) as Record<string, unknown>
-      if (typeof p.name === 'string' && p.name !== '') pkgName = p.name
-    } catch { /* keep record.name */ }
-  }
-  if (!/^[a-z0-9][a-z0-9._-]{0,99}$/.test(pkgName)) {
+  const packageName = packageNameFor(record)
+  if (!/^[a-z0-9][a-z0-9._-]{0,99}$/.test(packageName)) {
     return { ok: false, error: 'record contains an invalid package name; refusing to run dsh' }
   }
+  const installedRoot = join(resolve(deps.store.getRoot()), 'installed')
+  const expectedInstallPath = containPath(installedRoot, id)
+  if (!expectedInstallPath || resolve(record.install.installPath) !== expectedInstallPath) {
+    return { ok: false, error: 'record install path is not the expected Forge-managed destination; refusing uninstall cleanup' }
+  }
+  let operation: ForgeOperation | undefined
   try {
-    const r = await spawnProcess('dsh', ['plugin', '--profile', profile, 'remove', pkgName], { timeoutMs: 60_000 })
+    const startedAt = new Date().toISOString()
+    operation = {
+      kind: 'uninstall',
+      phase: 'prepared',
+      profile,
+      packageName,
+      installPath: expectedInstallPath,
+      startedAt,
+      updatedAt: startedAt,
+    }
+    const journaled = await deps.store.update(id, { status: 'uninstalling', operation })
+    if (!journaled) return { ok: false, error: 'could not persist uninstall journal; DSH was not invoked' }
+
+    const r = await spawnProcess('dsh', ['plugin', '--profile', profile, 'remove', packageName], { timeoutMs: 60_000 })
     const output = (r.stdout + '\n' + r.stderr).trim()
     if (r.exitCode !== 0 || /failed to remove|could not remove|not found/i.test(output)) {
-      return { ok: false, error: 'dsh plugin remove did not complete cleanly (exit ' + String(r.exitCode) + '): ' + (output || 'no diagnostic output').slice(0, 1000) }
+      operation = { ...operation, updatedAt: new Date().toISOString() }
+      await deps.store.update(id, { status: 'recovery_required', operation }).catch(() => null)
+      return {
+        ok: false,
+        error: 'dsh plugin remove did not complete cleanly (exit ' + String(r.exitCode) + '): ' +
+          (output || 'no diagnostic output').slice(0, 700) +
+          '; inspect the profile and run forge_reconcile with observedInstalled set to the actual DSH state',
+      }
     }
-    const digest = pluginContentDigest(record.files)
-    const status = record.test?.passed && digest && record.test.contentSha256 === digest
-      ? 'tested'
-      : record.validation?.valid && digest && record.validation.contentSha256 === digest
-        ? 'validated'
-        : 'generated'
-    const updated = await deps.store.update(id, { status, install: undefined, active: undefined })
-    if (!updated) return { ok: false, error: 'plugin was removed but forge state could not be updated' }
+
+    operation = { ...operation, phase: 'external_succeeded', updatedAt: new Date().toISOString() }
+    const externalSuccess = await deps.store.update(id, { status: 'uninstalling', operation })
+    if (!externalSuccess) {
+      return { ok: false, error: 'DSH uninstall succeeded but the journal phase could not be saved; inspect the profile and run forge_reconcile' }
+    }
+    const installedRootInfo = await lstat(installedRoot).catch(() => null)
+    const installTreeInfo = await lstat(expectedInstallPath).catch(() => null)
+    if (!installedRootInfo || !installedRootInfo.isDirectory() || installedRootInfo.isSymbolicLink() ||
+        (installTreeInfo && (!installTreeInfo.isDirectory() || installTreeInfo.isSymbolicLink()))) {
+      operation = { ...operation, updatedAt: new Date().toISOString() }
+      await deps.store.update(id, { status: 'recovery_required', operation }).catch(() => null)
+      return { ok: false, error: 'DSH removed the plugin, but its local install path is missing or unsafe; inspect and run forge_reconcile with observedInstalled=false' }
+    }
+    try {
+      if (installTreeInfo) await rm(expectedInstallPath, { recursive: true, force: false })
+    } catch (cleanupError) {
+      operation = { ...operation, updatedAt: new Date().toISOString() }
+      await deps.store.update(id, { status: 'recovery_required', operation }).catch(() => null)
+      return { ok: false, error: 'DSH removed the plugin, but the local install tree could not be cleaned; inspect and run forge_reconcile with observedInstalled=false: ' + (cleanupError instanceof Error ? cleanupError.message : String(cleanupError)) }
+    }
+    const status = statusAfterUninstall(record)
+    const updated = await deps.store.update(id, { status, install: undefined, active: undefined, operation: undefined })
+    if (!updated) {
+      await deps.store.update(id, { status: 'recovery_required', operation }).catch(() => null)
+      return { ok: false, error: 'plugin was removed but Forge state could not be committed; inspect the profile and run forge_reconcile' }
+    }
     return { ok: true }
   } catch (e) {
-    return { ok: false, error: 'uninstall failed: ' + (e instanceof Error ? e.message : String(e)) }
+    if (operation) {
+      operation = { ...operation, updatedAt: new Date().toISOString() }
+      await deps.store.update(id, { status: 'recovery_required', operation }).catch(() => null)
+    }
+    return {
+      ok: false,
+      error: (operation ? 'uninstall outcome may require reconciliation: ' : 'uninstall failed: ') +
+        (e instanceof Error ? e.message : String(e)),
+    }
   }
 }
 
@@ -914,6 +1082,7 @@ async function withActivationQueue<T>(action: () => Promise<T>): Promise<T> {
 }
 
 async function withLifecycleOperation<T extends { ok: boolean }>(
+  deps: ModuleDeps,
   id: string,
   action: () => Promise<T>,
 ): Promise<T | { ok: false; error: string }> {
@@ -923,7 +1092,9 @@ async function withLifecycleOperation<T extends { ok: boolean }>(
   }
   lifecycleOperations.add(id)
   try {
-    return await action()
+    return await deps.store.withExclusiveLock('lifecycle', id, action, 180_000)
+  } catch (e) {
+    return { ok: false, error: 'lifecycle operation could not acquire or complete its lock: ' + (e instanceof Error ? e.message : String(e)) }
   } finally {
     lifecycleOperations.delete(id)
   }
@@ -935,11 +1106,18 @@ async function activatePluginUnlocked(
 ): Promise<{ ok: true; toolNames: string[] } | { ok: false; error: string }> {
   const record = await deps.store.get(id)
   if (!record) return { ok: false, error: 'record not found or invalid record ID: ' + id }
+  if (record.operation) return { ok: false, error: 'record has an unfinished external operation; reconcile before activation' }
   if (activeFibers.has(id)) return { ok: false, error: 'plugin is already active in this host' }
   const evidenceError = freshEvidenceError(record, { requireValidation: true, requireTest: true })
   if (evidenceError) return { ok: false, error: 'cannot activate: ' + evidenceError }
   const safetyError = validateSafeFileSet(record.files)
   if (safetyError) return { ok: false, error: safetyError }
+  if (deps.cfg().forge.activation.allowInProcessExecution !== true) {
+    return {
+      ok: false,
+      error: 'in-process plugin execution is disabled by default; review the plugin source and explicitly set forge.activation.allowInProcessExecution=true to opt in',
+    }
+  }
 
   const ctx = deps.ctx
   if (typeof ctx.plugin !== 'function') {
@@ -1090,28 +1268,117 @@ export function installPlugin(
   id: string,
   profile?: string,
 ): Promise<{ ok: true; installPath: string; profile: string } | { ok: false; error: string }> {
-  return withLifecycleOperation(id, () => installPluginUnlocked(deps, id, profile))
+  const chosenProfile = profile === undefined ? deps.cfg().forge.defaultProfile : profile
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(chosenProfile)) {
+    return Promise.resolve({ ok: false, error: 'invalid DSH profile name; use letters, digits, underscore, or hyphen (max 64 chars)' })
+  }
+  return withLifecycleOperation(deps, id, () =>
+    deps.store.withExclusiveLock('profile', chosenProfile, () => installPluginUnlocked(deps, id, chosenProfile), 180_000)
+  )
 }
 
 export function uninstallPlugin(
   deps: ModuleDeps,
   id: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  return withLifecycleOperation(id, () => uninstallPluginUnlocked(deps, id))
+  return withLifecycleOperation(deps, id, async () => {
+    const record = await deps.store.get(id)
+    if (!record) return { ok: false, error: 'record not found or invalid record ID: ' + id }
+    if (!record.install?.installed) return { ok: false, error: 'plugin is not installed' }
+    return deps.store.withExclusiveLock('profile', record.install.profile, () => uninstallPluginUnlocked(deps, id), 180_000)
+  })
 }
 
 export function activatePlugin(
   deps: ModuleDeps,
   id: string,
 ): Promise<{ ok: true; toolNames: string[] } | { ok: false; error: string }> {
-  return withLifecycleOperation(id, () => withActivationQueue(() => activatePluginUnlocked(deps, id)))
+  return withLifecycleOperation(deps, id, () => withActivationQueue(() => activatePluginUnlocked(deps, id)))
 }
 
 export function deactivatePlugin(
   deps: ModuleDeps,
   id: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  return withLifecycleOperation(id, () => deactivatePluginUnlocked(deps, id))
+  return withLifecycleOperation(deps, id, () => deactivatePluginUnlocked(deps, id))
+}
+
+export async function reconcilePluginOperation(
+  deps: ModuleDeps,
+  id: string,
+  observedInstalled: boolean,
+): Promise<{ ok: true; status: ForgeRecord['status']; observedInstalled: boolean } | { ok: false; error: string }> {
+  if (!/^[a-f0-9]{12}$/.test(id)) return { ok: false, error: 'invalid record ID' }
+  if (typeof observedInstalled !== 'boolean') {
+    return { ok: false, error: 'observedInstalled must be the actual installed state checked in the DSH profile' }
+  }
+  try {
+    return await deps.store.withExclusiveLock('lifecycle', id, async () => {
+      const record = await deps.store.get(id)
+      if (!record) return { ok: false, error: 'record not found or invalid record ID: ' + id }
+      const operation = record.operation
+      if (!operation) return { ok: false, error: 'record has no unfinished install/uninstall operation to reconcile' }
+      const installedRoot = join(resolve(deps.store.getRoot()), 'installed')
+      const installedRootInfo = await lstat(installedRoot).catch(() => null)
+      if (!installedRootInfo || !installedRootInfo.isDirectory() || installedRootInfo.isSymbolicLink()) {
+        return { ok: false, error: 'installed state root is missing or is not a real directory; operation journal retained' }
+      }
+      const expectedInstallPath = containPath(installedRoot, id)
+      if (!expectedInstallPath || resolve(operation.installPath) !== expectedInstallPath) {
+        return { ok: false, error: 'journal installPath does not match the record-scoped Forge install path; refusing to remove or claim it' }
+      }
+
+      return await deps.store.withExclusiveLock('profile', operation.profile, async () => {
+        // Re-read inside both locks, so a stale record snapshot cannot erase a newer journal.
+        const current = await deps.store.get(id)
+        if (!current?.operation) return { ok: false, error: 'operation journal changed or was already reconciled' }
+        const currentOperation = current.operation
+        if (currentOperation.profile !== operation.profile ||
+            currentOperation.kind !== operation.kind ||
+            currentOperation.startedAt !== operation.startedAt) {
+          return { ok: false, error: 'operation journal changed while acquiring recovery locks; retry after inspection' }
+        }
+        const installInfo = await lstat(expectedInstallPath).catch(() => null)
+        if (observedInstalled) {
+          if (!installInfo || !installInfo.isDirectory() || installInfo.isSymbolicLink()) {
+            return { ok: false, error: 'DSH reports the package installed, but the Forge materialized directory is missing or unsafe; journal retained' }
+          }
+          if (!(await exists(join(expectedInstallPath, 'package.json'))) ||
+              !(await exists(join(expectedInstallPath, 'lib/index.js')))) {
+            return { ok: false, error: 'DSH reports the package installed, but the materialized manifest or runtime entry is missing; journal retained' }
+          }
+        } else if (installInfo) {
+          if (!installInfo.isDirectory() || installInfo.isSymbolicLink()) {
+            return { ok: false, error: 'refusing to remove an unsafe install path; journal retained' }
+          }
+          // A verified absent DSH package means the operation-owned materialized
+          // source tree can be removed before clearing the journal. If state commit
+          // fails, retrying observedInstalled=false remains safe.
+          await rm(expectedInstallPath, { recursive: true, force: true })
+        }
+
+        const now = new Date().toISOString()
+        const patch: Partial<ForgeRecord> = observedInstalled
+          ? {
+              status: 'installed',
+              install: { installed: true, profile: currentOperation.profile, installPath: expectedInstallPath, at: now },
+              active: undefined,
+              operation: undefined,
+            }
+          : {
+              status: statusAfterUninstall(current),
+              install: undefined,
+              active: undefined,
+              operation: undefined,
+            }
+        const updated = await deps.store.update(id, patch)
+        if (!updated) return { ok: false, error: 'could not commit reconciled state; operation journal was retained when possible' }
+        return { ok: true, status: updated.status, observedInstalled }
+      }, 180_000)
+    }, 180_000)
+  } catch (e) {
+    return { ok: false, error: 'reconciliation failed: ' + (e instanceof Error ? e.message : String(e)) }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1125,6 +1392,7 @@ export async function exportPlugin(
 ): Promise<{ ok: true; outPath: string } | { ok: false; error: string }> {
   const record = await deps.store.get(id)
   if (!record) return { ok: false, error: 'record not found or invalid record ID: ' + id }
+  if (record.operation) return { ok: false, error: 'record has an unfinished external operation; reconcile before export' }
   const safetyError = validateSafeFileSet(record.files)
   if (safetyError) return { ok: false, error: safetyError }
   const safeRecordName = /^[a-z0-9][a-z0-9._-]{0,99}$/.test(record.name) ? record.name : 'plugin'

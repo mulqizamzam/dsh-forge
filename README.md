@@ -91,9 +91,13 @@ Example plugin configuration:
       install:
         requireValidated: true
         requireTested: true
+      activation:
+        allowInProcessExecution: false
 ```
 
-Keep both install gates enabled. Setting either `requireValidated` or `requireTested` to `false` permits code to be installed or activated without that check. Only do so in a disposable environment when you understand the consequences.
+Keep both install gates enabled. Setting either `requireValidated` or `requireTested` to `false` permits code to be installed or activated without that check.
+
+**In-process activation is disabled by default.** `forge_test` runs the candidate under Bubblewrap, but `forge_activate` imports the candidate and executes it in the running DSH host process. Sandbox success does not constrain that runtime. Only after reviewing and trusting the plugin source, explicitly set `forge.activation.allowInProcessExecution: true` in the DSH plugin config to enable activation. This is a trust opt-in, not a sandbox or permission boundary.
 
 ## How the safety gates work
 
@@ -103,6 +107,8 @@ By default, both `forge_install` and `forge_activate` require:
 2. **A successful sandbox test** — the entry point must import and `apply` must register at least one tool against a fake host context within the configured timeout.
 
 These are preflight checks, not a security boundary for all plugin behavior. The test uses a fake context and cannot verify every real-host API interaction. Installation mutates the real DSH profile and is not run inside the sandbox. A plugin may still behave unexpectedly after installation or activation.
+
+If install or uninstall is interrupted or the DSH command changes the profile but Forge cannot commit its state, the record keeps an operation journal. Inspect the actual DSH profile, then call `forge_reconcile` with `observedInstalled: true` if the package is present or `false` if it is absent. Reconciliation is deliberately manual; Forge does not guess whether the external side effect happened.
 
 Read [SECURITY.md](SECURITY.md) before running plugins you did not write or audit.
 

@@ -6,6 +6,7 @@ export interface ForgeConfig {
     defaultProfile: string
     sandbox: { enabled: boolean; timeoutMs: number }
     install: { requireValidated: boolean; requireTested: boolean }
+    activation: { allowInProcessExecution: boolean }
   }
 }
 
@@ -15,6 +16,7 @@ export const DEFAULT_CONFIG: ForgeConfig = {
     defaultProfile: 'web',
     sandbox: { enabled: true, timeoutMs: 60_000 },
     install: { requireValidated: true, requireTested: true },
+    activation: { allowInProcessExecution: false },
   },
 }
 
@@ -30,6 +32,9 @@ export const Config = z.object({
       requireValidated: z.boolean().default(DEFAULT_CONFIG.forge.install.requireValidated),
       requireTested: z.boolean().default(DEFAULT_CONFIG.forge.install.requireTested),
     }).default(DEFAULT_CONFIG.forge.install),
+    activation: z.object({
+      allowInProcessExecution: z.boolean().default(DEFAULT_CONFIG.forge.activation.allowInProcessExecution),
+    }).default(DEFAULT_CONFIG.forge.activation),
   }).default(DEFAULT_CONFIG.forge),
 })
 
