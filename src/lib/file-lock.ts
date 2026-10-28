@@ -61,7 +61,10 @@ async function readLockOwner(path: string): Promise<LockOwner | null> {
 async function lockIsStale(path: string, staleInitializingMs: number): Promise<boolean> {
   let info
   try { info = await lstat(path) } catch (error) {
-    if (errorCode(error) === 'ENOENT') return true
+    // Absence is not a stale lock to reclaim. A contender may publish a new
+    // lock between this check and rename; report "not stale" and retry normal
+    // acquisition instead of allowing rename to steal that new live lock.
+    if (errorCode(error) === 'ENOENT') return false
     throw error
   }
   if (!info.isFile() || info.isSymbolicLink()) {
