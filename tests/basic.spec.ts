@@ -321,7 +321,7 @@ export async function apply(ctx) {
       expect(result.passed).toBe(false)
       return
     }
-    expect(result.stdout.trimEnd().split(/\\r?\\n/).slice(-1)[0]).toBe('FORGE_SANDBOX_RESULT:OK:sandbox-smoke')
+    expect(result.stdout.trimEnd().split(/\r?\n/).slice(-1)[0]).toBe('FORGE_SANDBOX_RESULT:OK:sandbox-smoke')
   })
 
 })
