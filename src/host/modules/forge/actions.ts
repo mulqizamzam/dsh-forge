@@ -689,7 +689,7 @@ console.log('FORGE_SANDBOX_RESULT:OK:' + registered.join(','))
       '--remount-ro', '/proc',
       '--remount-ro', '/dev',
       '/bin/sh', '-c',
-      `set -eu; if command -v bash >/dev/null 2>&1; then exec bash -c 'set -eu; ulimit -u 256 2>/dev/null || :; ulimit -Hu 256 2>/dev/null || :; ulimit -t 60; ulimit -Ht 60 2>/dev/null || :; exec node .forge-test.mjs'; else ulimit -t 60; ulimit -Ht 60 2>/dev/null || :; exec node .forge-test.mjs; fi`,
+      `set -eu; if command -v bash >/dev/null 2>&1; then exec bash -c 'set -eu; ulimit -u 256 2>/dev/null || :; ulimit -Hu 256 2>/dev/null || :; cpu=$(ulimit -St); if [ "$cpu" = unlimited ] || [ "$cpu" -gt 60 ]; then ulimit -St 60; fi; cpu_hard=$(ulimit -Ht); if [ "$cpu_hard" = unlimited ] || [ "$cpu_hard" -gt 60 ]; then ulimit -Ht 60 2>/dev/null || :; fi; exec node .forge-test.mjs'; else cpu=$(ulimit -t); if [ "$cpu" = unlimited ] || [ "$cpu" -gt 60 ]; then ulimit -t 60; fi; exec node .forge-test.mjs; fi`,
     )
 
     const r = await spawnProcess('bwrap', bwrapArgs, { timeoutMs })
