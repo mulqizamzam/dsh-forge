@@ -8,7 +8,7 @@
     "name": "Mulqizamzam"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.18.0"
   },
   "main": "lib/index.js",
   "exports": {
@@ -36,6 +36,7 @@
   },
   "scripts": {
     "build": "tsdown",
+    "prepare": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "validate": "python3 skills/dsh-plugin-autopilot/scripts/validate_plugin.py . --json",
