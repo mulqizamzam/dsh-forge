@@ -1,4 +1,4 @@
-import { join } from 'node:path'
+import { join, resolve, parse, relative, sep } from 'node:path'
 import { mkdir, lstat, chmod } from 'node:fs/promises'
 import { readJsonSafe, writeJsonAtomic, listDir } from '../lib/fsx.ts'
 import { newId, isoDateTime, isSafeKey } from '../lib/ids.ts'
@@ -31,9 +31,30 @@ export class ForgeStore {
   }
 
   async init(): Promise<void> {
-    await this.ensurePrivateDirectory(this.root)
+    const root = resolve(this.root)
+    const filesystemRoot = parse(root).root
+    if (root === filesystemRoot) {
+      throw new Error('stateRoot must not be a filesystem root')
+    }
+    const home = process.env.HOME ?? process.env.USERPROFILE
+    const protectedPaths = [resolve(process.cwd()), ...(home ? [resolve(home)] : [])]
+    for (const protectedPath of protectedPaths) {
+      const rel = relative(root, protectedPath)
+      if (rel === '' || (rel !== '..' && !rel.startsWith('..' + sep))) {
+        throw new Error('stateRoot must be a dedicated subdirectory, not a home directory or an ancestor of the working directory')
+      }
+    }
+
+    // Do not chmod the user-selected stateRoot: it may already contain unrelated
+    // files, or be intentionally shared. Only change permissions on our own
+    // dedicated subdirectories.
+    await mkdir(root, { recursive: true, mode: 0o700 })
+    const rootInfo = await lstat(root)
+    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
+      throw new Error('stateRoot must be a real directory, not a symlink')
+    }
     for (const name of ['records', 'installed', 'exports']) {
-      await this.ensurePrivateDirectory(join(this.root, name))
+      await this.ensurePrivateDirectory(join(root, name))
     }
   }
 
