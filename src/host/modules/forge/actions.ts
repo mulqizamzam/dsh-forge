@@ -218,6 +218,36 @@ export function pluginContentDigest(files: unknown): string | null {
   return createHash('sha256').update(JSON.stringify(normalized)).digest('hex')
 }
 
+/** Safety checks that remain mandatory even when users disable the optional contract gate. */
+function validateSafeFileSet(filesInput: unknown): string | null {
+  if (!Array.isArray(filesInput) || filesInput.length === 0) return 'plugin files must be a non-empty array'
+  if (filesInput.length > MAX_PLUGIN_FILES) return 'plugin exceeds ' + MAX_PLUGIN_FILES + ' file limit'
+  const files: PluginFile[] = []
+  for (const raw of filesInput) {
+    if (!raw || typeof raw !== 'object') return 'each plugin file must be an object'
+    const file = raw as Record<string, unknown>
+    if (typeof file.path !== 'string' || typeof file.content !== 'string') return 'each plugin file must contain string path and content fields'
+    files.push({ path: file.path, content: file.content })
+  }
+  const seen = new Set<string>()
+  const paths = files.map(file => file.path.toLowerCase())
+  let totalBytes = 0
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i]!
+    if (containPath('/plugin-root', file.path) === null) return 'unsafe file path: ' + file.path
+    const key = file.path.toLowerCase()
+    if (seen.has(key)) return 'duplicate file path: ' + file.path
+    seen.add(key)
+    if (file.path.split('/').some(segment => FORBIDDEN_SEGMENT_RE.test(segment))) return 'sensitive or vendor path is not allowed: ' + file.path
+    const bytes = Buffer.byteLength(file.content, 'utf8')
+    if (bytes > MAX_FILE_BYTES) return 'file exceeds 1 MiB size cap: ' + file.path
+    totalBytes += bytes
+    if (totalBytes > MAX_PLUGIN_BYTES) return 'plugin exceeds 5 MiB total content limit'
+    if (paths.some((other, j) => j !== i && other.startsWith(key + '/'))) return 'file path conflicts with a directory path: ' + file.path
+  }
+  return null
+}
+
 /** Remove comments and string/template literals before conservative source checks. */
 function stripJavaScriptCommentsAndLiterals(source: string): string {
   const out = source.split('')
@@ -253,7 +283,7 @@ export function validatePlugin(filesInput: unknown): { valid: boolean; errors: s
   const warnings: string[] = []
   if (!Array.isArray(filesInput)) return { valid: false, errors: ['plugin files must be an array'], warnings }
   if (filesInput.length === 0) return { valid: false, errors: ['plugin file list is empty'], warnings }
-  if (filesInput.length > MAX_PLUGIN_FILES) errors.push('plugin exceeds ' + MAX_PLUGIN_FILES + ' file limit')
+  if (filesInput.length > MAX_PLUGIN_FILES) return { valid: false, errors: ['plugin exceeds ' + MAX_PLUGIN_FILES + ' file limit'], warnings }
 
   const files: PluginFile[] = []
   for (const raw of filesInput) {
@@ -531,6 +561,8 @@ export async function testInSandbox(
       await mkdir(dirname(target), { recursive: true })
       await writeFile(target, f.content, 'utf8')
     }
+    const safetyError = validateSafeFileSet(files)
+    if (safetyError) return { passed: false, exitCode: null, stdout: '', stderr: safetyError, durationMs: 0, checkedAt }
     const entry = files.find(f => f.path === 'lib/index.js')?.path
     if (!entry) return { passed: false, exitCode: null, stdout: '', stderr: 'no lib/index.js runtime entry', durationMs: 0, checkedAt }
 
@@ -561,12 +593,12 @@ console.log('OK_TOOLS:' + registered.join(','))
       '--unshare-net',
       '--tmpfs', '/',
     ]
-    // Build an allowlisted, read-only system view. The empty root is critical:
-    // bind-mounting only /usr and /lib without tmpfs / still exposes the host disk.
-    for (const p of ['/usr', '/etc']) {
-      if (await exists(p)) {
-        bwrapArgs.push('--dir', p, '--ro-bind', p, p)
-      }
+    // Build an allowlisted, read-only system view. Never mount the host's whole
+    // /etc: it can contain credentials, tokens, private keys, and service config.
+    if (await exists('/usr')) bwrapArgs.push('--dir', '/usr', '--ro-bind', '/usr', '/usr')
+    // The dynamic loader may use this cache; expose only this single non-secret file.
+    if (await exists('/etc/ld.so.cache')) {
+      bwrapArgs.push('--dir', '/etc', '--ro-bind', '/etc/ld.so.cache', '/etc/ld.so.cache')
     }
     for (const p of ['/lib', '/lib64', '/bin', '/sbin']) {
       if (!(await exists(p))) continue
