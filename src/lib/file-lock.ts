@@ -180,10 +180,4 @@ export async function withFileLock<T>(
     const current = await readLockOwner(lockPath)
     if (current?.token === token) await unlink(lockPath).catch(() => {})
   }
-}  try {
-    return await action()
-  } finally {
-    const current = await readLockOwner(lockPath)
-    if (current?.token === token) await unlink(lockPath).catch(() => {})
-  }
 }
