@@ -361,6 +361,19 @@ export function validatePlugin(filesInput: unknown): { valid: boolean; errors: s
         errors.push('package.json: "name" must be a lowercase package slug (1–100 chars)')
       } else packageName = p.name
       if (p.type !== 'module') errors.push('package.json: "type" must be "module" for ESM plugin entries')
+      if (p.scripts !== undefined) {
+        if (!p.scripts || typeof p.scripts !== 'object' || Array.isArray(p.scripts) ||
+            Object.keys(p.scripts as Record<string, unknown>).length > 0) {
+          errors.push('package.json scripts are not permitted; package lifecycle scripts execute outside the sandbox')
+        }
+      }
+      for (const field of ['dependencies', 'optionalDependencies', 'devDependencies', 'peerDependencies', 'bundledDependencies']) {
+        const value = p[field]
+        if (value !== undefined && (!value || typeof value !== 'object' || Array.isArray(value) ||
+            Object.keys(value as Record<string, unknown>).length > 0)) {
+          errors.push('package.json ' + field + ' are not permitted; generated plugins must be self-contained')
+        }
+      }
       if (typeof p.version !== 'string' || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(p.version)) {
         errors.push('package.json: "version" must be valid semver')
       }

@@ -26,6 +26,51 @@ function makeDeps(store: ForgeStore): ModuleDeps {
   return { ctx: makeCtx(), cfg: () => resolveConfig({}), store, log: () => {}, warn: () => {} }
 }
 
+function makeActivationEnabledDeps(store: ForgeStore): ModuleDeps {
+  const deps = makeDeps(store)
+  const config = resolveConfig({})
+  config.forge.activation.allowInProcessExecution = true
+  deps.cfg = () => config
+  return deps
+}
+
+function buildValidPluginFiles(name: string): Array<{ path: string; content: string }> {
+  const toolName = name.replace(/-/g, '_') + '_smoke'
+  const entry = `export function apply(ctx) {
+  ctx.tools.register({
+    name: '${toolName}',
+    description: 'A valid self-contained plugin for hardening regression tests.',
+    parameters: { type: 'object', properties: {} },
+    output: { schema: { type: 'object' }, render: () => [] },
+    execute: async () => ({ ok: true }),
+  })
+}`
+  return [
+    { path: 'package.json', content: JSON.stringify({
+      name, version: '1.0.0', type: 'module',
+      main: 'lib/index.js', exports: { '.': './lib/index.js' },
+      dsh: { bundle: { patch: './cordis.patch.yml' }, engines: { dsh: '>=0.1.1-rc.1' } },
+    }) },
+    { path: 'cordis.patch.yml', content: `- insert:\\n    - id: ${name}\\n      name: ${name}\\n      config: {}` },
+    { path: 'src/index.js', content: entry },
+    { path: 'lib/index.js', content: entry },
+  ]
+}
+
+async function addValidatedTestedRecord(store: ForgeStore, name: string) {
+  const files = buildValidPluginFiles(name)
+  const validation = validatePlugin(files)
+  if (!validation.valid) throw new Error('test fixture invalid: ' + validation.errors.join('; '))
+  const record = await store.add({ name, description: 'validated regression fixture', files })
+  const digest = pluginContentDigest(files)!
+  const checkedAt = new Date().toISOString()
+  await store.update(record.id, {
+    validation: { ...validation, checkedAt, contentSha256: digest },
+    test: { passed: true, exitCode: 0, stdout: 'OK', stderr: '', durationMs: 1, checkedAt, contentSha256: digest },
+  })
+  return record
+}
+
 describe('dsh-forge smoke', () => {
   let root: string
   let store: ForgeStore
@@ -163,6 +208,31 @@ describe('dsh-forge install gate', () => {
     if (!result.ok) expect(result.error).toMatch(/validation/i)
   })
 
+  it('disables in-process activation until explicitly opted in', async () => {
+    const record = await addValidatedTestedRecord(store, 'activation-opt-in')
+    const deps = makeDeps(store)
+    let mountCalls = 0
+    deps.ctx.plugin = (module: unknown) => {
+      mountCalls++
+      const pluginModule = module as { apply?: (host: HostContextShape, config: unknown) => unknown }
+      pluginModule.apply?.(deps.ctx, {})
+      return { state: 'ACTIVE', inertia: Promise.resolve(), dispose: () => {} }
+    }
+
+    const blocked = await activatePlugin(deps, record.id)
+    expect(blocked.ok).toBe(false)
+    if (!blocked.ok) expect(blocked.error).toMatch(/disabled by default/i)
+    expect(mountCalls).toBe(0)
+
+    const enabled = makeActivationEnabledDeps(store)
+    enabled.ctx = deps.ctx
+    const activated = await activatePlugin(enabled, record.id)
+    expect(activated.ok).toBe(true)
+    expect(mountCalls).toBe(1)
+    const deactivated = await deactivatePlugin(enabled, record.id)
+    expect(deactivated.ok).toBe(true)
+  })
+
   it('retains a mounted Fiber after disposal fails so deactivation can retry', async () => {
     const { activatePlugin, deactivatePlugin } = await import('../src/host/modules/forge/actions.ts')
     const entry = `export function apply(ctx) {
@@ -208,7 +278,7 @@ describe('dsh-forge install gate', () => {
         },
       }
     }
-    const deps = makeDeps(store)
+    const deps = makeActivationEnabledDeps(store)
     deps.ctx = ctx
     const originalUpdate = store.update.bind(store)
     store.update = async (id, patch) => {
@@ -271,6 +341,27 @@ describe('path and package hardening', () => {
     expect(result.valid).toBe(false)
     expect(result.errors.join(' ')).toMatch(/duplicate file path/i)
     expect(result.errors.join(' ')).toMatch(/sensitive|vendor/i)
+  })
+
+  it('rejects install lifecycle scripts and external package dependencies', () => {
+    const entry = 'export function apply(ctx) { ctx.tools.register({ name: "t" }) }'
+    const base = {
+      name: 'self-contained', version: '1.0.0', type: 'module',
+      main: 'lib/index.js', exports: { '.': './lib/index.js' },
+      dsh: { bundle: { patch: './cordis.patch.yml' }, engines: { dsh: '>=0.1.1-rc.1' } },
+    }
+    const filesFor = (pkg: Record<string, unknown>) => [
+      { path: 'package.json', content: JSON.stringify(pkg) },
+      { path: 'cordis.patch.yml', content: '- insert:\\n    - id: self-contained\\n      name: self-contained\\n      config: {}' },
+      { path: 'src/index.js', content: entry },
+      { path: 'lib/index.js', content: entry },
+    ]
+    const withScript = validatePlugin(filesFor({ ...base, scripts: { prepare: 'node install.js' } }))
+    expect(withScript.valid).toBe(false)
+    expect(withScript.errors.join(' ')).toMatch(/scripts are not permitted/i)
+    const withDependency = validatePlugin(filesFor({ ...base, dependencies: { 'untrusted-runtime': '*' } }))
+    expect(withDependency.valid).toBe(false)
+    expect(withDependency.errors.join(' ')).toMatch(/dependencies are not permitted/i)
   })
 
   it('requires package main entry and registry identity to match', () => {
@@ -585,7 +676,7 @@ describe('lifecycle and persisted-state hardening', () => {
         dispose: () => {},
       }
     }
-    const deps = makeDeps(store)
+    const deps = makeActivationEnabledDeps(store)
     deps.ctx = ctx
 
     const firstActivation = activatePlugin(deps, record.id)
