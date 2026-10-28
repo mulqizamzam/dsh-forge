@@ -83,7 +83,7 @@ describe('dsh-forge smoke', () => {
 
   afterEach(async () => { await rm(root, { recursive: true, force: true }) })
 
-  it('registers 10 forge action tools', () => {
+  it('registers 11 forge action tools', () => {
     const tools = forgeTools(makeDeps(store))
     expect(tools.length).toBe(11)
     const names = tools.map(t => t.name).sort()
@@ -230,6 +230,38 @@ describe('dsh-forge install gate', () => {
     expect((await readFile(callLog, 'utf8')).trim().split(/\r?\n/)).toHaveLength(1)
     expect((await store.get(first.id))?.install?.installed).toBe(true)
     expect((await store.get(second.id))?.install?.installed).not.toBe(true)
+  })
+
+  it('refuses to overwrite an existing install tree before invoking DSH', async () => {
+    const record = await addValidatedTestedRecord(store, 'existing-install-tree')
+    const installPath = join(root, 'installed', record.id)
+    await mkdir(installPath, { recursive: true })
+    const sentinelPath = join(installPath, 'operator-owned.txt')
+    await writeFile(sentinelPath, 'must survive')
+
+    const fakeBin = join(root, 'fake-dsh-bin')
+    await mkdir(fakeBin)
+    const callLog = join(root, 'dsh-calls.log')
+    await writeFile(join(fakeBin, 'dsh'), '#!/bin/sh\necho called >> "$FORGE_TEST_DSH_CALL_LOG"\nexit 0\n')
+    await chmod(join(fakeBin, 'dsh'), 0o700)
+    const priorPath = process.env.PATH
+    const priorLog = process.env.FORGE_TEST_DSH_CALL_LOG
+    let result: Awaited<ReturnType<typeof installPlugin>>
+    try {
+      process.env.PATH = [fakeBin, priorPath].filter((part): part is string => !!part).join(delimiter)
+      process.env.FORGE_TEST_DSH_CALL_LOG = callLog
+      result = await installPlugin(makeDeps(store), record.id, 'web')
+    } finally {
+      if (priorPath === undefined) delete process.env.PATH
+      else process.env.PATH = priorPath
+      if (priorLog === undefined) delete process.env.FORGE_TEST_DSH_CALL_LOG
+      else process.env.FORGE_TEST_DSH_CALL_LOG = priorLog
+    }
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toMatch(/install destination already exists/i)
+    expect(await readFile(sentinelPath, 'utf8')).toBe('must survive')
+    await expect(readFile(callLog, 'utf8')).rejects.toThrow()
+    expect((await store.get(record.id))?.operation).toBeUndefined()
   })
 
   it('install refuses without validation', async () => {
@@ -629,6 +661,26 @@ describe('lifecycle and persisted-state hardening', () => {
   })
   afterEach(async () => { await rm(root, { recursive: true, force: true }) })
 
+  it('rejects a malformed persisted external-operation journal', async () => {
+    const record = await store.add({ name: 'x', description: 'd', files: [] })
+    const recordPath = join(root, 'records', record.id + '.json')
+    const malformed = {
+      ...record,
+      status: 'recovery_required',
+      operation: {
+        kind: 'install',
+        phase: 'unknown_phase',
+        profile: 'web',
+        packageName: 'x',
+        installPath: join(root, 'installed', record.id),
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+    }
+    await writeFile(recordPath, JSON.stringify(malformed))
+    expect(await store.get(record.id)).toBeNull()
+  })
+
   it('rejects records with malformed nested validation state', async () => {
     const record = await store.add({ name: 'x', description: 'd', files: [] })
     const recordPath = join(root, 'records', record.id + '.json')
@@ -796,6 +848,24 @@ describe('cross-process lock hardening', () => {
     const { withFileLock } = await import('../src/lib/file-lock.ts')
     await withFileLock(lockPath, async () => { ran = true }, { timeoutMs: 2000 })
     expect(ran).toBe(true)
+  })
+
+  it('does not steal an old lock owned by another host', async () => {
+    const lockPath = join(root, 'remote-owner.lock')
+    const ownerToken = 'remote-owner-token-abcdefghijkl'
+    const { hostname } = await import('node:os')
+    await writeFile(lockPath, JSON.stringify({
+      token: ownerToken,
+      pid: process.pid,
+      host: hostname() + '-different-host',
+      createdAt: Date.now() - 60_000,
+    }))
+    let ran = false
+    const { withFileLock } = await import('../src/lib/file-lock.ts')
+    await expect(withFileLock(lockPath, async () => { ran = true }, { timeoutMs: 100 }))
+      .rejects.toThrow(/timed out waiting for cross-process lock/i)
+    expect(ran).toBe(false)
+    expect(JSON.parse(await readFile(lockPath, 'utf8')).token).toBe(ownerToken)
   })
 })
 
