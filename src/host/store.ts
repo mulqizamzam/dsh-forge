@@ -4,7 +4,7 @@ import { mkdir, lstat, chmod, realpath } from 'node:fs/promises'
 import { readJsonSafe, writeJsonAtomic, listDir } from '../lib/fsx.ts'
 import { withFileLock } from '../lib/file-lock.ts'
 import { newId, isoDateTime, isSafeKey } from '../lib/ids.ts'
-import type { ForgeRecord, PluginFile } from './types.ts'
+import type { ForgeRecord, ForgeOperation, PluginFile } from './types.ts'
 
 export interface ForgeStoreOptions {
   root: string
@@ -141,7 +141,18 @@ export class ForgeStore {
     )) return null
     if (typeof record.createdAt !== 'string' || !Number.isFinite(Date.parse(record.createdAt))) return null
     if (typeof record.updatedAt !== 'string' || !Number.isFinite(Date.parse(record.updatedAt))) return null
-    if (!['generated', 'validated', 'tested', 'installed', 'active', 'failed'].includes(String(record.status))) return null
+    if (!['generated', 'validated', 'tested', 'installed', 'active', 'failed', 'installing', 'uninstalling', 'recovery_required'].includes(String(record.status))) return null
+    if (record.operation !== undefined) {
+      if (!record.operation || typeof record.operation !== 'object' || Array.isArray(record.operation)) return null
+      const operation = record.operation as Record<string, unknown>
+      if (!['install', 'uninstall'].includes(String(operation.kind)) ||
+          !['prepared', 'external_succeeded'].includes(String(operation.phase)) ||
+          typeof operation.profile !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(operation.profile) ||
+          typeof operation.packageName !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(operation.packageName) ||
+          typeof operation.installPath !== 'string' || operation.installPath === '' ||
+          typeof operation.startedAt !== 'string' || !Number.isFinite(Date.parse(operation.startedAt)) ||
+          typeof operation.updatedAt !== 'string' || !Number.isFinite(Date.parse(operation.updatedAt))) return null
+    }
     if (record.validation !== undefined) {
       if (!record.validation || typeof record.validation !== 'object' || Array.isArray(record.validation)) return null
       const validation = record.validation as Record<string, unknown>
