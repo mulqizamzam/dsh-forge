@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, rm, writeFile, symlink } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile, symlink, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { ForgeStore } from '../src/host/store.ts'
+import { writeJsonAtomic } from '../src/lib/fsx.ts'
 import { resolveConfig } from '../src/host/config.ts'
 import { forgeTools } from '../src/host/modules/forge/tools.ts'
 import { validatePlugin, testInSandbox, pluginContentDigest, validateRuntimeToolDefinition } from '../src/host/modules/forge/actions.ts'
@@ -418,6 +419,23 @@ describe('dsh-forge store', () => {
     const updated = await store.update(rec.id, { status: 'validated' })
     expect(updated?.id).toBe(rec.id)
     expect(updated?.status).toBe('validated')
+  })
+
+  it('serializes concurrent disjoint record updates without losing fields', async () => {
+    const rec = await store.add({ name: 'x', description: 'd', files: [] })
+    await Promise.all([
+      store.update(rec.id, { validation: { valid: true, errors: [], warnings: [], checkedAt: '2026-01-01T00:00:00.000Z' } }),
+      store.update(rec.id, { test: { passed: true, exitCode: 0, stdout: '', stderr: '', durationMs: 1, checkedAt: '2026-01-01T00:00:00.000Z' } }),
+    ])
+    const after = await store.get(rec.id)
+    expect(after?.validation?.valid).toBe(true)
+    expect(after?.test?.passed).toBe(true)
+  })
+
+  it('cleans up temporary files when JSON serialization fails', async () => {
+    await expect(writeJsonAtomic(join(root, 'records', 'bad.json'), undefined)).rejects.toThrow(/serialize undefined/i)
+    const entries = await readdir(join(root, 'records'))
+    expect(entries.some(entry => entry.includes('.tmp.'))).toBe(false)
   })
 
   it('does not follow symlinked record files', async () => {
