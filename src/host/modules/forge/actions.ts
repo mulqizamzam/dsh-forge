@@ -955,27 +955,42 @@ export async function exportPlugin(
   outPath?: string,
 ): Promise<{ ok: true; outPath: string } | { ok: false; error: string }> {
   const record = await deps.store.get(id)
-  if (!record) return { ok: false, error: 'record not found: ' + id }
-  // Export stored record content, never an installPath loaded from persisted JSON
-  // or mutable files that may have appeared in the installed directory.
+  if (!record) return { ok: false, error: 'record not found or invalid record ID: ' + id }
+  const safetyError = validateSafeFileSet(record.files)
+  if (safetyError) return { ok: false, error: safetyError }
+  const safeRecordName = /^[a-z0-9][a-z0-9._-]{0,99}$/.test(record.name) ? record.name : 'plugin'
+  const exportRoot = resolve(deps.store.getRoot(), 'exports')
+  const out = resolve(outPath ?? join(exportRoot, safeRecordName + '-' + id + '.tgz'))
+  if (outPath && !isAbsolute(outPath)) return { ok: false, error: 'outPath must be absolute' }
+  // Keep the archive write scoped to the dedicated exports directory; otherwise
+  // an agent-influenced path could overwrite arbitrary files available to DSH.
+  if (dirname(out) !== exportRoot) return { ok: false, error: 'export path must be a direct child of the forge exports directory' }
+  const exportRootStat = await lstat(exportRoot).catch(() => null)
+  if (!exportRootStat || !exportRootStat.isDirectory() || exportRootStat.isSymbolicLink()) {
+    return { ok: false, error: 'exports path must be a real directory, not a symlink' }
+  }
+  const existing = await lstat(out).catch(() => null)
+  if (existing && (!existing.isFile() || existing.isSymbolicLink())) {
+    return { ok: false, error: 'refusing to overwrite a non-regular export target' }
+  }
+
   const srcPath = await mkdtemp(join(tmpdir(), 'forge-export-'))
   try {
-    for (const f of record.files) {
-      const target = containPath(srcPath, f.path)
-      if (target === null) return { ok: false, error: 'unsafe file path: ' + f.path }
-      await mkdir(dirname(target), { recursive: true, mode: 0o755 })
-      await writeFile(target, f.content, { encoding: 'utf8', mode: 0o644 })
+    for (const file of record.files) {
+      const target = containPath(srcPath, file.path)
+      if (!target) return { ok: false, error: 'unsafe file path: ' + file.path }
+      await mkdir(dirname(target), { recursive: true, mode: 0o700 })
+      await writeFile(target, file.content, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
     }
-    const safeRecordName = /^[a-z0-9][a-z0-9._-]{0,99}$/.test(record.name) ? record.name : 'plugin'
-    const out = resolve(outPath ?? join(deps.store.getRoot(), 'exports', `${safeRecordName}-${id}.tgz`))
-    if (containPath(srcPath, out) !== null) return { ok: false, error: 'export path must be outside the staging directory' }
-    await mkdir(dirname(out), { recursive: true })
     const r = await spawnProcess('tar', [
       '--sort=name', '--mtime=@0', '--owner=0', '--group=0', '--numeric-owner',
       '-czf', out, '-C', srcPath, '.',
     ], { timeoutMs: 30_000 })
-    if (r.exitCode !== 0) return { ok: false, error: 'tar failed: ' + r.stderr.slice(0, 500) }
+    const output = (r.stdout + '\n' + r.stderr).trim()
+    if (r.exitCode !== 0) return { ok: false, error: 'tar failed (exit ' + String(r.exitCode) + '): ' + (output || 'no diagnostic output').slice(0, 1000) }
     return { ok: true, outPath: out }
+  } catch (e) {
+    return { ok: false, error: 'export failed: ' + (e instanceof Error ? e.message : String(e)) }
   } finally {
     await rm(srcPath, { recursive: true, force: true }).catch(() => { /* ignore */ })
   }
