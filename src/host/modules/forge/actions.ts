@@ -3,7 +3,8 @@
 // retry on empty output), fail-closed static validation, sandboxed test
 // (process-group timeout), gated install, activation, export, submission.
 
-import { join, dirname, resolve } from 'node:path'
+import { join, dirname, resolve, isAbsolute } from 'node:path'
+import { createHash } from 'node:crypto'
 import { mkdir, writeFile, rm, mkdtemp, access } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
@@ -200,16 +201,77 @@ const MAX_FILE_BYTES = 1 * 1024 * 1024 // per-file content cap
 const MAX_PLUGIN_BYTES = 5 * 1024 * 1024 // aggregate model output / storage cap
 const MAX_PLUGIN_FILES = 200
 const MAX_CAPTURE_CHARS = 64 * 1024
-const FORBIDDEN_SEGMENT_RE = /^(?:\.git|node_modules|\.env(?:\..*)?|\.npmrc|\.pypirc|credentials?(?:\..*)?|secrets?(?:\..*)?|id_(?:rsa|ed25519))$/i
+const MAX_DESCRIPTION_CHARS = 12_000
+const FORBIDDEN_SEGMENT_RE = /^(?:\.git|node_modules|\.env(?:\..*)?|\.npmrc|\.pypirc|credentials?(?:\..*)?|secrets?(?:\..*)?|id_(?:rsa|ed25519)(?:\..*)?|authorized_keys|known_hosts)$/i
 
-export function validatePlugin(files: PluginFile[]): { valid: boolean; errors: string[]; warnings: string[] } {
+/** Canonical digest used to tie validation and test results to exact stored bytes. */
+export function pluginContentDigest(files: unknown): string | null {
+  if (!Array.isArray(files)) return null
+  const normalized: Array<[string, string]> = []
+  for (const entry of files) {
+    if (!entry || typeof entry !== 'object') return null
+    const item = entry as Record<string, unknown>
+    if (typeof item.path !== 'string' || typeof item.content !== 'string') return null
+    normalized.push([item.path, item.content])
+  }
+  normalized.sort((a, b) => a[0].localeCompare(b[0]))
+  return createHash('sha256').update(JSON.stringify(normalized)).digest('hex')
+}
+
+/** Remove comments and string/template literals before conservative source checks. */
+function stripJavaScriptCommentsAndLiterals(source: string): string {
+  const out = source.split('')
+  let state: 'code' | 'line' | 'block' | 'single' | 'double' | 'template' = 'code'
+  let escaped = false
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i]!
+    const next = source[i + 1] ?? ''
+    if (state === 'code') {
+      if (ch === '/' && next === '/') { out[i] = ' '; out[i + 1] = ' '; i++; state = 'line'; continue }
+      if (ch === '/' && next === '*') { out[i] = ' '; out[i + 1] = ' '; i++; state = 'block'; continue }
+      if (ch === "'") { out[i] = ' '; state = 'single'; escaped = false; continue }
+      if (ch === '"') { out[i] = ' '; state = 'double'; escaped = false; continue }
+      if (ch.charCodeAt(0) === 96) { out[i] = ' '; state = 'template'; escaped = false; continue }
+    } else if (state === 'line') {
+      if (ch === '\n' || ch === '\r') state = 'code'
+      else out[i] = ' '
+    } else if (state === 'block') {
+      if (ch === '*' && next === '/') { out[i] = ' '; out[i + 1] = ' '; i++; state = 'code'; continue }
+      if (ch !== '\n' && ch !== '\r') out[i] = ' '
+    } else {
+      if (ch !== '\n' && ch !== '\r') out[i] = ' '
+      if (escaped) { escaped = false; continue }
+      if (ch === '\\') { escaped = true; continue }
+      if ((state === 'single' && ch === "'") || (state === 'double' && ch === '"') || (state === 'template' && ch.charCodeAt(0) === 96)) state = 'code'
+    }
+  }
+  return out.join('')
+}
+
+export function validatePlugin(filesInput: unknown): { valid: boolean; errors: string[]; warnings: string[] } {
   const errors: string[] = []
   const warnings: string[] = []
-  if (files.length > MAX_PLUGIN_FILES) errors.push('plugin exceeds ' + MAX_PLUGIN_FILES + ' file limit')
+  if (!Array.isArray(filesInput)) return { valid: false, errors: ['plugin files must be an array'], warnings }
+  if (filesInput.length === 0) return { valid: false, errors: ['plugin file list is empty'], warnings }
+  if (filesInput.length > MAX_PLUGIN_FILES) errors.push('plugin exceeds ' + MAX_PLUGIN_FILES + ' file limit')
+
+  const files: PluginFile[] = []
+  for (const raw of filesInput) {
+    if (!raw || typeof raw !== 'object') { errors.push('each plugin file must be an object'); continue }
+    const item = raw as Record<string, unknown>
+    if (typeof item.path !== 'string' || typeof item.content !== 'string') {
+      errors.push('each plugin file must contain string path and content fields')
+      continue
+    }
+    files.push({ path: item.path, content: item.content })
+  }
+  if (errors.length > 0) return { valid: false, errors, warnings }
 
   const seenPaths = new Set<string>()
   let totalBytes = 0
-  for (const f of files) {
+  const normalizedPaths = files.map(f => f.path.toLowerCase())
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i]!
     if (containPath('/plugin-root', f.path) === null) {
       errors.push('unsafe file path: ' + f.path)
       continue
@@ -223,6 +285,12 @@ export function validatePlugin(files: PluginFile[]): { valid: boolean; errors: s
     const bytes = Buffer.byteLength(f.content, 'utf8')
     totalBytes += bytes
     if (bytes > MAX_FILE_BYTES) errors.push('file exceeds 1 MiB size cap: ' + f.path)
+    for (let j = 0; j < normalizedPaths.length; j++) {
+      if (i !== j && normalizedPaths[j]!.startsWith(portablePath + '/')) {
+        errors.push('file path conflicts with a directory path: ' + f.path)
+        break
+      }
+    }
   }
   if (totalBytes > MAX_PLUGIN_BYTES) errors.push('plugin exceeds 5 MiB total content limit')
   if (errors.length > 0) return { valid: false, errors, warnings }
@@ -233,34 +301,47 @@ export function validatePlugin(files: PluginFile[]): { valid: boolean; errors: s
   else {
     try {
       const p = JSON.parse(pkg.content) as Record<string, unknown>
+      if (!p || typeof p !== 'object' || Array.isArray(p)) throw new Error('package.json root must be an object')
       if (typeof p.name !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(p.name)) {
         errors.push('package.json: "name" must be a lowercase package slug (1–100 chars)')
       } else packageName = p.name
       if (p.type !== 'module') errors.push('package.json: "type" must be "module" for ESM plugin entries')
-      if (typeof p.version !== 'string' || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(p.version)) {
+      if (typeof p.version !== 'string' || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(p.version)) {
         errors.push('package.json: "version" must be valid semver')
       }
       if (p.main !== 'lib/index.js') errors.push('package.json: "main" must be "lib/index.js"')
       const exports = p.exports as Record<string, unknown> | undefined
-      if (!exports || typeof exports !== 'object' || exports['.'] !== './lib/index.js') {
+      if (!exports || typeof exports !== 'object' || Array.isArray(exports) || exports['.'] !== './lib/index.js') {
         errors.push('package.json: exports["."] must be "./lib/index.js"')
       }
       const dsh = p.dsh as Record<string, unknown> | undefined
-      if (!dsh || typeof dsh !== 'object') errors.push('package.json: "dsh" object is required')
+      if (!dsh || typeof dsh !== 'object' || Array.isArray(dsh)) errors.push('package.json: "dsh" object is required')
       else {
         const bundle = dsh.bundle as Record<string, unknown> | undefined
-        if (!bundle || bundle.patch !== './cordis.patch.yml') errors.push('package.json: dsh.bundle.patch must be "./cordis.patch.yml"')
+        if (!bundle || typeof bundle !== 'object' || bundle.patch !== './cordis.patch.yml') errors.push('package.json: dsh.bundle.patch must be "./cordis.patch.yml"')
+        const engines = dsh.engines as Record<string, unknown> | undefined
+        if (!engines || engines.dsh !== '>=0.1.1-rc.1') errors.push('package.json: dsh.engines.dsh must be ">=0.1.1-rc.1"')
       }
-    } catch { errors.push('package.json is not valid JSON') }
+    } catch { errors.push('package.json is not valid JSON or must contain an object') }
   }
 
   const patch = files.find(f => f.path === 'cordis.patch.yml')
   if (!patch) errors.push('missing cordis.patch.yml')
   else {
-    if (!/^[ \t]*-[ \t]*insert[ \t]*:/m.test(patch.content)) errors.push('cordis.patch.yml must contain a top-level "insert:" block')
-    const patchId = patch.content.match(/^[ \t]{4,}-[ \t]*id[ \t]*:[ \t]*([^\s#]+)[ \t]*$/m)?.[1]?.replace(/^['"]|['"]$/g, '')
-    if (!patchId) errors.push('cordis.patch.yml must define an insert row with an id')
-    else if (packageName && patchId !== packageName) errors.push('cordis.patch.yml insert id must match package.json name')
+    const lines = patch.content.split(/\r?\n/)
+    const insertLine = lines.findIndex(line => /^-[ \t]*insert[ \t]*:/.test(line))
+    if (insertLine < 0) errors.push('cordis.patch.yml must contain a top-level "insert:" block')
+    else {
+      let end = insertLine + 1
+      while (end < lines.length && (lines[end]!.trim() === '' || /^[ \t]/.test(lines[end]!))) end++
+      const insertBlock = lines.slice(insertLine, end).join('\n')
+      const idMatch = insertBlock.match(/^[ \t]{4,}-[ \t]*id[ \t]*:[ \t]*(["']?)([a-z0-9][a-z0-9._-]{0,99})\1[ \t]*(?:#.*)?$/m)
+      const nameMatch = insertBlock.match(/^[ \t]{6,}name[ \t]*:[ \t]*(["']?)([a-z0-9][a-z0-9._-]{0,99})\1[ \t]*(?:#.*)?$/m)
+      if (!idMatch) errors.push('cordis.patch.yml insert block must define a row with an id')
+      else if (packageName && idMatch[2] !== packageName) errors.push('cordis.patch.yml insert id must match package.json name')
+      if (!nameMatch) errors.push('cordis.patch.yml insert block must define a row with a name')
+      else if (packageName && nameMatch[2] !== packageName) errors.push('cordis.patch.yml insert name must match package.json name')
+    }
   }
 
   const sourceEntry = files.find(f => f.path === 'src/index.js')
@@ -269,8 +350,9 @@ export function validatePlugin(files: PluginFile[]): { valid: boolean; errors: s
   if (!runtimeEntry) errors.push('missing runtime entry: lib/index.js is required by package.json')
   for (const [label, entry] of [['src/index.js', sourceEntry], ['lib/index.js', runtimeEntry]] as const) {
     if (!entry) continue
-    if (!APPLY_EXPORT_RE.test(entry.content)) errors.push(label + ' must export an "apply" symbol')
-    if (!entry.content.includes('ctx.tools.register') && !entry.content.includes('.tools.register')) {
+    const code = stripJavaScriptCommentsAndLiterals(entry.content)
+    if (!APPLY_EXPORT_RE.test(code)) errors.push(label + ' must export an "apply" symbol')
+    if (!/\b(?:ctx\s*\.?\s*tools|\.?\s*tools)\s*\.\s*register\b/.test(code)) {
       errors.push(label + ' must register at least one DSH tool')
     }
   }
@@ -550,6 +632,8 @@ export async function generatePlugin(
   description: string,
 ): Promise<{ record: ForgeRecord } | { error: string }> {
   try {
+    if (typeof description !== 'string' || description.trim() === '') return { error: 'plugin description is required' }
+    if (description.length > MAX_DESCRIPTION_CHARS) return { error: 'plugin description exceeds ' + MAX_DESCRIPTION_CHARS + ' characters' }
     const { text, usage } = await callHostLLM(deps, SYSTEM_PROMPT, description)
     const { name, files } = extractFileSet(text)
     const record = await deps.store.add({ name, description, files, llmUsage: usage })
