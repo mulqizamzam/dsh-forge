@@ -833,7 +833,7 @@ export async function uninstallPlugin(
 // Activate / Deactivate — C1 fix: restore register in finally
 // ─────────────────────────────────────────────────────────────────────────────
 
-type ActivePlugin = { fiber: { dispose?: () => unknown }; activePath: string }
+type ActivePlugin = { fiber: { dispose?: () => unknown; state?: unknown; inertia?: Promise<unknown> }; activePath: string }
 const activeFibers = new Map<string, ActivePlugin>()
 
 export async function activatePlugin(
@@ -899,14 +899,19 @@ export async function activatePlugin(
     return { ok: false, error: 'host tool registry cannot be instrumented: ' + (e instanceof Error ? e.message : String(e)) }
   }
 
-  let fiber: { dispose?: () => unknown } | undefined
+  let fiber: { dispose?: () => unknown; state?: unknown; inertia?: Promise<unknown> } | undefined
   let mountError: string | undefined
   try {
-    const mounted = ctx.plugin(mod, {})
-    fiber = mounted && typeof (mounted as { then?: unknown }).then === 'function'
-      ? await mounted as { dispose?: () => unknown }
-      : mounted as { dispose?: () => unknown } | undefined
+    // DSH ctx.plugin() returns a Cordis Fiber synchronously. Do not await the
+    // Fiber itself: that can accidentally wait for the entire plugin lifetime.
+    fiber = ctx.plugin(mod, {}) as typeof fiber
     if (!fiber || typeof fiber !== 'object') throw new Error('mount produced no fiber')
+    // Wait only for an in-flight load transition when the host exposes it.
+    if (fiber.inertia && typeof (fiber.inertia as { then?: unknown }).then === 'function') {
+      await fiber.inertia
+    }
+    const state = typeof fiber.state === 'string' ? fiber.state.toUpperCase() : undefined
+    if (state && state !== 'ACTIVE') throw new Error('plugin Fiber did not reach ACTIVE state (state=' + state + ')')
     activeFibers.set(id, { fiber, activePath })
     const updated = await deps.store.update(id, {
       status: 'active',
