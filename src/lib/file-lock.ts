@@ -61,7 +61,10 @@ async function readLockOwner(path: string): Promise<LockOwner | null> {
 async function lockIsStale(path: string, staleInitializingMs: number): Promise<boolean> {
   let info
   try { info = await lstat(path) } catch (error) {
-    if (errorCode(error) === 'ENOENT') return true
+    // Absence is not a stale lock to reclaim. A contender may publish a new
+    // lock between this check and rename; report "not stale" and retry normal
+    // acquisition instead of allowing rename to steal that new live lock.
+    if (errorCode(error) === 'ENOENT') return false
     throw error
   }
   if (!info.isFile() || info.isSymbolicLink()) {
@@ -92,6 +95,62 @@ async function lockIsStale(path: string, staleInitializingMs: number): Promise<b
     if (currentStart && currentStart !== owner.processStart) return true
   }
   return false
+}
+
+type ReclaimResult = 'reclaimed' | 'not-stale' | 'busy'
+
+/**
+ * Serialize stale-owner reclamation. Without this second, short-lived marker,
+ * two contenders can both observe an old owner; the first removes it and
+ * acquires a new lock, then the second renames that new live lock based on its
+ * stale observation. The recovery marker is deliberately fail-closed if its
+ * owner crashes: inspect it before manual removal rather than racing to steal it.
+ */
+async function reclaimStaleLock(path: string, staleInitializingMs: number): Promise<ReclaimResult> {
+  const recoveryPath = path + '.recovery'
+  let handle: Awaited<ReturnType<typeof open>> | undefined
+  try {
+    handle = await open(recoveryPath, 'wx', 0o600)
+  } catch (error) {
+    if (errorCode(error) === 'EEXIST') return 'busy'
+    throw error
+  }
+
+  try {
+    const processStart = await linuxProcessStart(process.pid)
+    const recoveryOwner: LockOwner = {
+      token: randomUUID(),
+      pid: process.pid,
+      host: hostname(),
+      createdAt: Date.now(),
+      ...(processStart ? { processStart } : {}),
+    }
+    await handle.writeFile(JSON.stringify(recoveryOwner), 'utf8')
+    await handle.sync()
+    await handle.close()
+    handle = undefined
+
+    // Re-check only while holding the exclusive recovery marker. A prior stale
+    // observation is not sufficient because another contender may have changed
+    // the canonical lock between observation and recovery-marker acquisition.
+    if (!(await lockIsStale(path, staleInitializingMs))) return 'not-stale'
+
+    const retired = path + '.stale-' + randomUUID()
+    try {
+      await rename(path, retired)
+      await unlink(retired).catch(() => {})
+      return 'reclaimed'
+    } catch (error) {
+      const code = errorCode(error)
+      if (code === 'ENOENT' || code === 'EEXIST' || code === 'ENOTEMPTY') return 'not-stale'
+      throw error
+    }
+  } finally {
+    await handle?.close().catch(() => {})
+    // Only the process that created this marker can reach this finally block.
+    // A crash intentionally leaves it behind for operator inspection.
+    await unlink(recoveryPath).catch(() => {})
+  }
 }
 
 /**
@@ -157,19 +216,16 @@ export async function withFileLock<T>(
 
     if (acquired) break
     if (await lockIsStale(lockPath, staleInitializingMs)) {
-      const retired = lockPath + '.stale-' + randomUUID()
-      try {
-        await rename(lockPath, retired)
-        await unlink(retired).catch(() => {})
-        continue
-      } catch (renameError) {
-        const code = errorCode(renameError)
-        if (code === 'ENOENT' || code === 'EEXIST' || code === 'ENOTEMPTY') continue
-        throw renameError
-      }
+      const reclaimed = await reclaimStaleLock(lockPath, staleInitializingMs)
+      if (reclaimed === 'reclaimed') continue
     }
     if (Date.now() >= deadline) {
-      throw new Error('timed out waiting for cross-process lock: ' + lockPath)
+      const recoveryPath = lockPath + '.recovery'
+      const recoveryInfo = await lstat(recoveryPath).catch(() => null)
+      const recoveryNote = recoveryInfo
+        ? '; stale-lock recovery marker exists at ' + recoveryPath + ' — inspect its owner and remove it manually only after confirming no recovery process is alive'
+        : ''
+      throw new Error('timed out waiting for cross-process lock: ' + lockPath + recoveryNote)
     }
     await new Promise<void>(resolveDelay => setTimeout(resolveDelay, 50))
   }
