@@ -1,12 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, rm, writeFile, symlink, readdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { mkdtemp, rm, writeFile, readFile, mkdir, chmod, symlink, readdir } from 'node:fs/promises'
+import { join, delimiter } from 'node:path'
 import { tmpdir } from 'node:os'
 import { ForgeStore } from '../src/host/store.ts'
 import { readJsonSafe, writeJsonAtomic } from '../src/lib/fsx.ts'
 import { resolveConfig } from '../src/host/config.ts'
 import { forgeTools } from '../src/host/modules/forge/tools.ts'
-import { validatePlugin, testInSandbox, pluginContentDigest, validateRuntimeToolDefinition, installPlugin, activatePlugin } from '../src/host/modules/forge/actions.ts'
+import { validatePlugin, testInSandbox, pluginContentDigest, validateRuntimeToolDefinition, installPlugin, activatePlugin, deactivatePlugin, exportPlugin } from '../src/host/modules/forge/actions.ts'
 import type { ModuleDeps } from '../src/host/types.ts'
 import type { HostContextShape } from '../src/host/dsh.ts'
 
@@ -503,15 +503,108 @@ describe('lifecycle and persisted-state hardening', () => {
     await writeFile(recordPath, JSON.stringify(malformed))
     expect(await store.get(record.id)).toBeNull()
   })
+  it('preserves an existing archive and removes staging files when tar fails', async () => {
+    const record = await store.add({
+      name: 'export-failure',
+      description: 'export cleanup regression',
+      files: [{ path: 'package.json', content: '{"name":"export-failure","version":"1.0.0"}' }],
+    })
+    const exportsDir = join(root, 'exports')
+    const archivePath = join(exportsDir, `export-failure-${record.id}.tgz`)
+    const sentinel = 'existing-archive-must-survive'
+    await writeFile(archivePath, sentinel)
 
-  it('rejects simultaneous lifecycle operations for the same record', async () => {
-    const record = await store.add({ name: 'x', description: 'd', files: [] })
+    const fakeBin = join(root, 'fake-bin')
+    await mkdir(fakeBin)
+    await writeFile(join(fakeBin, 'tar'), '#!/bin/sh\nprintf "forced tar failure\\n" >&2\nexit 19\n')
+    await chmod(join(fakeBin, 'tar'), 0o700)
+
+    const previousPath = process.env.PATH
+    process.env.PATH = [fakeBin, previousPath].filter((part): part is string => typeof part === 'string' && part !== '').join(delimiter)
+    let result: Awaited<ReturnType<typeof exportPlugin>>
+    try {
+      result = await exportPlugin(makeDeps(store), record.id)
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH
+      else process.env.PATH = previousPath
+    }
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toMatch(/tar failed/i)
+    expect(await readFile(archivePath, 'utf8')).toBe(sentinel)
+    expect((await readdir(exportsDir)).filter(name => name.endsWith('.tmp.tgz'))).toEqual([])
+  })
+
+
+  it('serializes lifecycle operations per record and releases the guard after failure', async () => {
+    const entry = `export function apply(ctx) {
+  ctx.tools.register({
+    name: 'lifecycle_smoke',
+    description: 'A valid tool for lifecycle concurrency regression coverage.',
+    parameters: { type: 'object', properties: {} },
+    output: { schema: { type: 'object' }, render: () => [] },
+    execute: async () => ({ ok: true }),
+  })
+}`
+    const files = [
+      { path: 'package.json', content: JSON.stringify({
+        name: 'lifecycle-smoke', version: '1.0.0', type: 'module',
+        main: 'lib/index.js', exports: { '.': './lib/index.js' },
+        dsh: { bundle: { patch: './cordis.patch.yml' }, engines: { dsh: '>=0.1.1-rc.1' } },
+      }) },
+      { path: 'cordis.patch.yml', content: '- insert:\n    - id: lifecycle-smoke\n      name: lifecycle-smoke\n      config: {}' },
+      { path: 'src/index.js', content: entry },
+      { path: 'lib/index.js', content: entry },
+    ]
+    const validation = validatePlugin(files)
+    expect(validation.valid).toBe(true)
+    const record = await store.add({ name: 'lifecycle-smoke', description: 'lifecycle race regression', files })
+    const digest = pluginContentDigest(files)!
+    const checkedAt = new Date().toISOString()
+    await store.update(record.id, {
+      validation: { ...validation, checkedAt, contentSha256: digest },
+      test: { passed: true, exitCode: 0, stdout: 'OK', stderr: '', durationMs: 1, checkedAt, contentSha256: digest },
+    })
+
+    const ctx = makeCtx()
+    let mountCount = 0
+    let signalFirstMount!: () => void
+    const firstMount = new Promise<void>(resolve => { signalFirstMount = resolve })
+    let failFirstMount!: (reason?: Error) => void
+    const blockedInertia = new Promise<void>((_resolve, reject) => { failFirstMount = reject })
+    ctx.plugin = (module: unknown) => {
+      const pluginModule = module as { apply?: (host: HostContextShape, config: unknown) => unknown }
+      pluginModule.apply?.(ctx, {})
+      mountCount++
+      if (mountCount === 1) signalFirstMount()
+      return {
+        state: 'ACTIVE',
+        inertia: mountCount === 1 ? blockedInertia : Promise.resolve(),
+        dispose: () => {},
+      }
+    }
     const deps = makeDeps(store)
-    const [first, second] = await Promise.all([
-      installPlugin(deps, record.id),
-      activatePlugin(deps, record.id),
-    ])
-    expect(first.ok).toBe(false)
-    expect(second.ok).toBe(false)
+    deps.ctx = ctx
+
+    const firstActivation = activatePlugin(deps, record.id)
+    await firstMount
+    const overlappingDeactivation = await deactivatePlugin(deps, record.id)
+    expect(overlappingDeactivation.ok).toBe(false)
+    if (!overlappingDeactivation.ok) {
+      expect(overlappingDeactivation.error).toMatch(/lifecycle operation is already in progress/i)
+    }
+
+    // Force the first operation down its error path, then prove its finally
+    // released the per-record guard by activating successfully on the retry.
+    failFirstMount(new Error('simulated transient mount failure'))
+    const failedActivation = await firstActivation
+    expect(failedActivation.ok).toBe(false)
+    if (!failedActivation.ok) expect(failedActivation.error).toMatch(/mount failed/i)
+
+    const retryActivation = await activatePlugin(deps, record.id)
+    expect(retryActivation.ok).toBe(true)
+    expect(mountCount).toBe(2)
+    const deactivation = await deactivatePlugin(deps, record.id)
+    expect(deactivation.ok).toBe(true)
   })
 })

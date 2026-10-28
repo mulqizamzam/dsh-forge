@@ -4,7 +4,7 @@
 // (process-group timeout), gated install, activation, export, submission.
 
 import { join, dirname, resolve, isAbsolute } from 'node:path'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, writeFile, rm, mkdtemp, access, lstat } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
@@ -792,7 +792,7 @@ function hasDshLoadFailure(output: string): boolean {
   return /failed to import|did not activate|ERR_MODULE_NOT_FOUND|plugin activation failed/i.test(output)
 }
 
-export async function installPlugin(
+async function installPluginUnlocked(
   deps: ModuleDeps,
   id: string,
   profile?: string,
@@ -841,7 +841,7 @@ export async function installPlugin(
 // Uninstall
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function uninstallPlugin(
+async function uninstallPluginUnlocked(
   deps: ModuleDeps,
   id: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -891,7 +891,45 @@ export async function uninstallPlugin(
 type ActivePlugin = { fiber: { dispose?: () => unknown; state?: unknown; inertia?: Promise<unknown> }; activePath: string; disposed?: boolean }
 const activeFibers = new Map<string, ActivePlugin>()
 
-export async function activatePlugin(
+// Lifecycle actions may touch the same DSH profile, Fiber, and persisted record.
+// Serialize them per record in this process; the guard is acquired synchronously
+// before any I/O and is released on every return/throw path.
+const lifecycleOperations = new Set<string>()
+
+// ctx.tools.register belongs to the shared host, not to an individual plugin.
+// Only one activation may instrument it at a time, including across record IDs.
+let activationQueue: Promise<void> = Promise.resolve()
+
+async function withActivationQueue<T>(action: () => Promise<T>): Promise<T> {
+  const previous = activationQueue
+  let release!: () => void
+  const current = new Promise<void>(resolve => { release = resolve })
+  activationQueue = current
+  await previous
+  try {
+    return await action()
+  } finally {
+    release()
+  }
+}
+
+async function withLifecycleOperation<T extends { ok: boolean }>(
+  id: string,
+  action: () => Promise<T>,
+): Promise<T | { ok: false; error: string }> {
+  if (!/^[a-f0-9]{12}$/.test(id)) return { ok: false, error: 'invalid record ID' }
+  if (lifecycleOperations.has(id)) {
+    return { ok: false, error: 'another lifecycle operation is already in progress for this record' }
+  }
+  lifecycleOperations.add(id)
+  try {
+    return await action()
+  } finally {
+    lifecycleOperations.delete(id)
+  }
+}
+
+async function activatePluginUnlocked(
   deps: ModuleDeps,
   id: string,
 ): Promise<{ ok: true; toolNames: string[] } | { ok: false; error: string }> {
@@ -1006,7 +1044,7 @@ export async function activatePlugin(
   return { ok: true, toolNames: registered }
 }
 
-export async function deactivatePlugin(
+async function deactivatePluginUnlocked(
   deps: ModuleDeps,
   id: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -1045,6 +1083,37 @@ export async function deactivatePlugin(
   return { ok: true }
 }
 
+// Public lifecycle entry points all share one per-record guard. Keep the lock
+// outside the implementations so it is held across every await and recovery path.
+export function installPlugin(
+  deps: ModuleDeps,
+  id: string,
+  profile?: string,
+): Promise<{ ok: true; installPath: string; profile: string } | { ok: false; error: string }> {
+  return withLifecycleOperation(id, () => installPluginUnlocked(deps, id, profile))
+}
+
+export function uninstallPlugin(
+  deps: ModuleDeps,
+  id: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  return withLifecycleOperation(id, () => uninstallPluginUnlocked(deps, id))
+}
+
+export function activatePlugin(
+  deps: ModuleDeps,
+  id: string,
+): Promise<{ ok: true; toolNames: string[] } | { ok: false; error: string }> {
+  return withLifecycleOperation(id, () => withActivationQueue(() => activatePluginUnlocked(deps, id)))
+}
+
+export function deactivatePlugin(
+  deps: ModuleDeps,
+  id: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  return withLifecycleOperation(id, () => deactivatePluginUnlocked(deps, id))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Export — package as .tgz
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1075,7 +1144,7 @@ export async function exportPlugin(
   }
 
   const srcPath = await mkdtemp(join(tmpdir(), 'forge-export-'))
-  const stagedOut = join(exportRoot, '.' + safeRecordName + '-' + id + '-' + Date.now().toString(36) + '.tmp.tgz')
+  const stagedOut = join(exportRoot, '.' + safeRecordName + '-' + id + '-' + randomUUID() + '.tmp.tgz')
   let archiveCommitted = false
   try {
     for (const file of record.files) {
