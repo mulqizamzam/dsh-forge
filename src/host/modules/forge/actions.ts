@@ -836,7 +836,6 @@ export async function installPlugin(
     return { ok: true, installPath: materialized.installPath, profile: chosenProfile }
   } catch (e) {
     return { ok: false, error: 'install failed: ' + (e instanceof Error ? e.message : String(e)) }
-  }
 
   } finally {
     endLifecycleOperation(id)
@@ -889,7 +888,6 @@ export async function uninstallPlugin(
     return { ok: true }
   } catch (e) {
     return { ok: false, error: 'uninstall failed: ' + (e instanceof Error ? e.message : String(e)) }
-  }
 
   } finally {
     endLifecycleOperation(id)
