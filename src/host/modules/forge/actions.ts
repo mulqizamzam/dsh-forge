@@ -545,13 +545,12 @@ export async function testInSandbox(
   timeoutMs: number,
 ): Promise<ForgeRecord['test']> {
   const checkedAt = new Date().toISOString()
+  const safetyError = validateSafeFileSet(files)
+  if (safetyError) {
+    return { passed: false, exitCode: null, stdout: '', stderr: safetyError, durationMs: 0, checkedAt }
+  }
   if (!(await bwrapAvailable())) {
     return { passed: false, exitCode: null, stdout: '', stderr: 'bwrap not available — cannot run sandbox test', durationMs: 0, checkedAt }
-  }
-  for (const f of files) {
-    if (containPath('/forge-test', f.path) === null) {
-      return { passed: false, exitCode: null, stdout: '', stderr: 'unsafe path: ' + f.path, durationMs: 0, checkedAt }
-    }
   }
   const workDir = await mkdtemp(join(tmpdir(), 'forge-test-'))
   try {
@@ -561,8 +560,6 @@ export async function testInSandbox(
       await mkdir(dirname(target), { recursive: true })
       await writeFile(target, f.content, 'utf8')
     }
-    const safetyError = validateSafeFileSet(files)
-    if (safetyError) return { passed: false, exitCode: null, stdout: '', stderr: safetyError, durationMs: 0, checkedAt }
     const entry = files.find(f => f.path === 'lib/index.js')?.path
     if (!entry) return { passed: false, exitCode: null, stdout: '', stderr: 'no lib/index.js runtime entry', durationMs: 0, checkedAt }
 
@@ -750,14 +747,16 @@ export async function installPlugin(
   if (activeFibers.has(id)) return { ok: false, error: 'deactivate the plugin before reinstalling it' }
   if (record.install?.installed) return { ok: false, error: 'plugin is already installed; uninstall it before reinstalling' }
   const cfg = deps.cfg().forge
-  const safetyError = validateSafeFileSet(record.files)
-  if (safetyError) return { ok: false, error: safetyError }
+  // Check explicit gates first so callers get the actionable missing-validation
+  // message even when an untouched draft has no files yet.
   const evidenceError = freshEvidenceError(record, {
     requireValidation: cfg.install.requireValidated,
     requireTest: cfg.install.requireTested,
   })
   if (evidenceError) return { ok: false, error: 'refusing to install: ' + evidenceError }
-  const chosenProfile = profile || cfg.defaultProfile
+  const safetyError = validateSafeFileSet(record.files)
+  if (safetyError) return { ok: false, error: safetyError }
+  const chosenProfile = profile === undefined ? cfg.defaultProfile : profile
   if (!/^[a-zA-Z0-9_-]{1,64}$/.test(chosenProfile)) {
     return { ok: false, error: 'invalid DSH profile name; use letters, digits, underscore, or hyphen (max 64 chars)' }
   }
