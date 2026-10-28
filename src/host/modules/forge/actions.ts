@@ -891,17 +891,6 @@ export async function uninstallPlugin(
 type ActivePlugin = { fiber: { dispose?: () => unknown; state?: unknown; inertia?: Promise<unknown> }; activePath: string; disposed?: boolean }
 const activeFibers = new Map<string, ActivePlugin>()
 
-const lifecycleOperations = new Set<string>()
-
-function beginLifecycleOperation(id: string): boolean {
-  if (!/^[a-f0-9]{12}$/.test(id) || lifecycleOperations.has(id)) return false
-  lifecycleOperations.add(id)
-  return true
-}
-
-function endLifecycleOperation(id: string): void {
-  lifecycleOperations.delete(id)
-
   } finally {
     endLifecycleOperation(id)
   }
