@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { apply } from '../src/host/index.ts'
-import { resolveConfig } from '../src/host/config.ts'
+import { Config, resolveConfig } from '../src/host/config.ts'
 import type { HostContextShape, ToolDefinition } from '../src/host/dsh.ts'
 
 function live<T>(read: () => T): { get: () => T } {
@@ -20,6 +20,24 @@ describe('modern DSH settings compatibility', () => {
     if (originalDshHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = originalDshHome
     vi.restoreAllMocks()
+  })
+
+  it('exposes volatile references for default values to the DSH loader', () => {
+    const raw = Config({}) as unknown as {
+      forge: {
+        defaultProfile: { get: () => unknown }
+        sandbox: { enabled: { get: () => unknown }; timeoutMs: { get: () => unknown } }
+        install: { requireValidated: { get: () => unknown }; requireTested: { get: () => unknown } }
+        activation: { allowInProcessExecution: { get: () => unknown } }
+      }
+    }
+
+    expect(typeof raw.forge.defaultProfile?.get).toBe('function')
+    expect(typeof raw.forge.sandbox.enabled?.get).toBe('function')
+    expect(typeof raw.forge.sandbox.timeoutMs?.get).toBe('function')
+    expect(typeof raw.forge.install.requireValidated?.get).toBe('function')
+    expect(typeof raw.forge.install.requireTested?.get).toBe('function')
+    expect(typeof raw.forge.activation.allowInProcessExecution?.get).toBe('function')
   })
 
   it('unwraps Volatile references afresh on each config read', () => {
