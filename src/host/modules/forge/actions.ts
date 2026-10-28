@@ -914,6 +914,7 @@ async function withActivationQueue<T>(action: () => Promise<T>): Promise<T> {
 }
 
 async function withLifecycleOperation<T extends { ok: boolean }>(
+  deps: ModuleDeps,
   id: string,
   action: () => Promise<T>,
 ): Promise<T | { ok: false; error: string }> {
@@ -923,7 +924,9 @@ async function withLifecycleOperation<T extends { ok: boolean }>(
   }
   lifecycleOperations.add(id)
   try {
-    return await action()
+    return await deps.store.withExclusiveLock('lifecycle', id, action, 180_000)
+  } catch (e) {
+    return { ok: false, error: 'lifecycle operation could not acquire or complete its lock: ' + (e instanceof Error ? e.message : String(e)) }
   } finally {
     lifecycleOperations.delete(id)
   }
@@ -1090,28 +1093,39 @@ export function installPlugin(
   id: string,
   profile?: string,
 ): Promise<{ ok: true; installPath: string; profile: string } | { ok: false; error: string }> {
-  return withLifecycleOperation(id, () => installPluginUnlocked(deps, id, profile))
+  const chosenProfile = profile === undefined ? deps.cfg().forge.defaultProfile : profile
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(chosenProfile)) {
+    return Promise.resolve({ ok: false, error: 'invalid DSH profile name; use letters, digits, underscore, or hyphen (max 64 chars)' })
+  }
+  return withLifecycleOperation(deps, id, () =>
+    deps.store.withExclusiveLock('profile', chosenProfile, () => installPluginUnlocked(deps, id, chosenProfile), 180_000)
+  )
 }
 
 export function uninstallPlugin(
   deps: ModuleDeps,
   id: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  return withLifecycleOperation(id, () => uninstallPluginUnlocked(deps, id))
+  return withLifecycleOperation(deps, id, async () => {
+    const record = await deps.store.get(id)
+    if (!record) return { ok: false, error: 'record not found or invalid record ID: ' + id }
+    if (!record.install?.installed) return { ok: false, error: 'plugin is not installed' }
+    return deps.store.withExclusiveLock('profile', record.install.profile, () => uninstallPluginUnlocked(deps, id), 180_000)
+  })
 }
 
 export function activatePlugin(
   deps: ModuleDeps,
   id: string,
 ): Promise<{ ok: true; toolNames: string[] } | { ok: false; error: string }> {
-  return withLifecycleOperation(id, () => withActivationQueue(() => activatePluginUnlocked(deps, id)))
+  return withLifecycleOperation(deps, id, () => withActivationQueue(() => activatePluginUnlocked(deps, id)))
 }
 
 export function deactivatePlugin(
   deps: ModuleDeps,
   id: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  return withLifecycleOperation(id, () => deactivatePluginUnlocked(deps, id))
+  return withLifecycleOperation(deps, id, () => deactivatePluginUnlocked(deps, id))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

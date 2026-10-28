@@ -1,6 +1,8 @@
 import { join, resolve, parse, relative, sep } from 'node:path'
+import { createHash } from 'node:crypto'
 import { mkdir, lstat, chmod, realpath } from 'node:fs/promises'
 import { readJsonSafe, writeJsonAtomic, listDir } from '../lib/fsx.ts'
+import { withFileLock } from '../lib/file-lock.ts'
 import { newId, isoDateTime, isSafeKey } from '../lib/ids.ts'
 import type { ForgeRecord, PluginFile } from './types.ts'
 
@@ -20,6 +22,25 @@ export class ForgeStore {
   }
 
   getRoot(): string { return this.root }
+
+  /** Cross-process exclusive lock for record/lifecycle/profile operations. */
+  async withExclusiveLock<T>(
+    scope: string,
+    key: string,
+    action: () => Promise<T>,
+    timeoutMs = 120_000,
+  ): Promise<T> {
+    if (!/^[a-z][a-z0-9-]{0,31}$/.test(scope) || typeof key !== 'string' || key === '') {
+      throw new Error('invalid lock scope or key')
+    }
+    const lockDir = join(resolve(this.root), '.locks')
+    const lockDirInfo = await lstat(lockDir).catch(() => null)
+    if (!lockDirInfo || !lockDirInfo.isDirectory() || lockDirInfo.isSymbolicLink()) {
+      throw new Error('lock directory is missing or is not a real directory')
+    }
+    const keyHash = createHash('sha256').update(key).digest('hex').slice(0, 40)
+    return withFileLock(join(lockDir, scope + '-' + keyHash + '.lock'), action, { timeoutMs })
+  }
 
   /** Reject symlinks in every existing path component, not just the leaf. */
   private async assertPathHasNoSymlink(path: string): Promise<void> {
@@ -75,7 +96,7 @@ export class ForgeStore {
     if (await realpath(root) !== root) {
       throw new Error('stateRoot must not resolve through a non-canonical path')
     }
-    for (const name of ['records', 'installed', 'exports']) {
+    for (const name of ['records', 'installed', 'exports', '.locks']) {
       await this.ensurePrivateDirectory(join(root, name))
     }
   }
@@ -98,7 +119,12 @@ export class ForgeStore {
       files: input.files,
       llmUsage: input.llmUsage,
     }
-    await writeJsonAtomic(join(this.recordsDir(), `${full.id}.json`), full)
+    await this.withExclusiveLock('record', full.id, async () => {
+      const recordPath = join(this.recordsDir(), `${full.id}.json`)
+      const existing = await lstat(recordPath).catch(() => null)
+      if (existing) throw new Error('record ID collision; retry record creation')
+      await writeJsonAtomic(recordPath, full)
+    })
     return full
   }
 
@@ -166,11 +192,13 @@ export class ForgeStore {
     this.recordLocks.set(id, current)
     await previous
     try {
-      const existing = await this.get(id)
-      if (!existing) return null
-      const updated: ForgeRecord = { ...existing, ...patch, id, updatedAt: isoDateTime(this.nowFn()) }
-      await writeJsonAtomic(join(this.recordsDir(), `${id}.json`), updated)
-      return updated
+      return await this.withExclusiveLock('record', id, async () => {
+        const existing = await this.get(id)
+        if (!existing) return null
+        const updated: ForgeRecord = { ...existing, ...patch, id, updatedAt: isoDateTime(this.nowFn()) }
+        await writeJsonAtomic(join(this.recordsDir(), `${id}.json`), updated)
+        return updated
+      })
     } finally {
       release()
       if (this.recordLocks.get(id) === current) this.recordLocks.delete(id)

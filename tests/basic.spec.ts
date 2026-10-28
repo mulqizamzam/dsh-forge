@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, rm, writeFile, readFile, mkdir, chmod, symlink, readdir } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile, readFile, appendFile, mkdir, chmod, symlink, readdir } from 'node:fs/promises'
 import { join, delimiter } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { ForgeStore } from '../src/host/store.ts'
 import { readJsonSafe, writeJsonAtomic } from '../src/lib/fsx.ts'
@@ -606,5 +608,62 @@ describe('lifecycle and persisted-state hardening', () => {
     expect(mountCount).toBe(2)
     const deactivation = await deactivatePlugin(deps, record.id)
     expect(deactivation.ok).toBe(true)
+  })
+})
+
+describe('cross-process lock hardening', () => {
+  let root: string
+  beforeEach(async () => { root = await mkdtemp(join(tmpdir(), 'forge-lock-')) })
+  afterEach(async () => { await rm(root, { recursive: true, force: true }) })
+
+  it('serializes two independent Node processes and reclaims a provably dead owner', async () => {
+    const lockPath = join(root, 'shared.lock')
+    const tracePath = join(root, 'trace.log')
+    const lockModule = pathToFileURL(join(process.cwd(), 'src/lib/file-lock.ts')).href
+    const workerSource = `
+      import { appendFile } from 'node:fs/promises'
+      const { withFileLock } = await import(${JSON.stringify(lockModule)})
+      const lockPath = process.env.FORGE_TEST_LOCK_PATH
+      const tracePath = process.env.FORGE_TEST_TRACE_PATH
+      if (!lockPath || !tracePath) throw new Error('test environment missing paths')
+      await withFileLock(lockPath, async () => {
+        await appendFile(tracePath, 'enter ' + String(process.pid) + ' ' + String(Date.now()) + '\\n')
+        await new Promise(resolve => setTimeout(resolve, 160))
+        await appendFile(tracePath, 'exit ' + String(process.pid) + ' ' + String(Date.now()) + '\\n')
+      }, { timeoutMs: 8000 })
+    `
+    const runWorker = () => new Promise<void>((resolve, reject) => {
+      const child = spawn(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e', workerSource], {
+        env: { ...process.env, FORGE_TEST_LOCK_PATH: lockPath, FORGE_TEST_TRACE_PATH: tracePath },
+        stdio: ['ignore', 'ignore', 'pipe'],
+      })
+      let stderr = ''
+      child.stderr.on('data', chunk => { stderr += String(chunk).slice(0, 4000) })
+      child.once('error', reject)
+      child.once('close', code => {
+        if (code === 0) resolve()
+        else reject(new Error('lock worker failed (' + String(code) + '): ' + stderr))
+      })
+    })
+    await Promise.all([runWorker(), runWorker()])
+    const events = (await readFile(tracePath, 'utf8')).trim().split(/\\r?\\n/).map(line => line.split(' '))
+    expect(events.map(event => event[0])).toEqual(['enter', 'exit', 'enter', 'exit'])
+    expect(events[0]?.[1]).toBe(events[1]?.[1])
+    expect(events[2]?.[1]).toBe(events[3]?.[1])
+    expect(events[0]?.[1]).not.toBe(events[2]?.[1])
+
+    // Model a crashed process. The lock is reclaimable only because its PID is
+    // provably absent on this same host; remote-host locks are deliberately not stolen.
+    const deadPid = 999_999_999
+    await writeFile(lockPath, JSON.stringify({
+      token: 'dead-owner-token-123456789',
+      pid: deadPid,
+      host: (await import('node:os')).hostname(),
+      createdAt: Date.now() - 60_000,
+    }))
+    let ran = false
+    const { withFileLock } = await import('../src/lib/file-lock.ts')
+    await withFileLock(lockPath, async () => { ran = true }, { timeoutMs: 2000 })
+    expect(ran).toBe(true)
   })
 })
