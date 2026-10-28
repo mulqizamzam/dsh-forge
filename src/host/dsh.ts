@@ -12,7 +12,8 @@ export interface HostSettingsScope<T> { get(): T }
 
 export interface HostSettingsService {
   readonly writable: boolean
-  register<T>(
+  /** Removed from DSH 0.1.7+; retained as an optional legacy compatibility surface. */
+  register?<T>(
     namespace: string,
     schema: unknown,
     options: { base?: Partial<T>; applies: 'live' | 'restart'; validate?: (value: T) => void },

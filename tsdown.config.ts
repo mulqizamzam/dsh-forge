@@ -16,7 +16,7 @@ const host: UserConfig = {
   fixedExtension: false,
   dts: false,
   clean: true,
-  external: ['schemastery'],
+  external: ['@deepseek-ai/schemastery'],
   define: { 'PKG_VERSION': JSON.stringify(pkg.version) },
 }
 

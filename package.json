@@ -43,7 +43,7 @@
     "self-check": "python3 skills/dsh-plugin-autopilot/scripts/validate_plugin.py . --json"
   },
   "dependencies": {
-    "schemastery": "^3.18.0"
+    "@deepseek-ai/schemastery": "~3.18.4"
   },
   "devDependencies": {
     "@types/node": "^22.20.3",

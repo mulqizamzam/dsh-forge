@@ -37,7 +37,7 @@ function makeLogger(prefix: string): Logger {
   }
 }
 
-export async function apply(rawContext: unknown, rawConfig: Partial<ForgeConfig> = {}): Promise<void> {
+export async function apply(rawContext: unknown, rawConfig: unknown = {}): Promise<void> {
   const log = makeLogger('dsh-forge')
   const ctx = rawContext as HostContextShape
   try {
@@ -64,29 +64,44 @@ export async function apply(rawContext: unknown, rawConfig: Partial<ForgeConfig>
 
 async function boot(
   ctx: HostContextShape,
-  rawConfig: Partial<ForgeConfig>,
+  rawConfig: unknown,
   log: Logger,
 ): Promise<void> {
-  let resolved = resolveConfig(rawConfig)
+  // DSH 0.1.7+ removed settings.register(): forms are derived from this entry's
+  // exported Config schema, and volatile fields are updated by reference. Resolve
+  // the incoming config on demand so every operation observes the latest values.
+  // Retain the old registration path only for hosts that still expose it.
+  let legacyResolved: ReturnType<typeof resolveConfig> | undefined
+  let legacySettingsEnabled = false
   try {
-    const scope = ctx.settings.register<ForgeConfig>('dsh-forge', Config, {
-      base: rawConfig as ForgeConfig,
-      applies: 'live',
-    })
-    try { resolved = resolveConfig(scope.get()) } catch (e) {
-      log.warn('settings scope read failed: ' + errorMessage(e))
+    const settings = ctx.settings
+    if (typeof settings?.register === 'function') {
+      const scope = settings.register<ForgeConfig>('dsh-forge', Config, {
+        base: rawConfig as ForgeConfig,
+        applies: 'live',
+      })
+      legacyResolved = resolveConfig(scope.get())
+      legacySettingsEnabled = true
+      try {
+        ctx.on('settings/updated', ((ns: string, next: ForgeConfig) => {
+          if (ns !== 'dsh-forge') return
+          try {
+            legacyResolved = resolveConfig(next)
+            log.info('config swapped (legacy settings API)')
+          } catch (e) {
+            log.warn('config swap failed: ' + errorMessage(e))
+          }
+        }) as never)
+      } catch { /* optional legacy event surface */ }
     }
   } catch (e) {
-    log.warn('settings.register unavailable: ' + errorMessage(e))
+    log.warn('legacy settings registration failed; using entry Config: ' + errorMessage(e))
   }
-  try {
-    ctx.on('settings/updated', ((ns: string, next: ForgeConfig) => {
-      if (ns !== 'dsh-forge') return
-      try { resolved = resolveConfig(next); log.info('config swapped (live)') } catch (e) {
-        log.warn('config swap failed: ' + errorMessage(e))
-      }
-    }) as never)
-  } catch { /* non-fatal */ }
+
+  const readConfig = () => legacySettingsEnabled && legacyResolved
+    ? legacyResolved
+    : resolveConfig(rawConfig)
+  const resolved = readConfig()
 
   let profileName: string | undefined
   try {
@@ -129,7 +144,7 @@ async function boot(
   await store.init()
   log.info('state at ' + root)
 
-  const cfg = () => resolved
+  const cfg = () => readConfig()
   const deps: ModuleDeps = {
     ctx,
     cfg,
