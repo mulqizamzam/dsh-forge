@@ -12,6 +12,7 @@ import {
   testInSandbox,
   uninstallPlugin,
   validatePlugin,
+  pluginContentDigest,
 } from './actions.ts'
 
 const RENDER = (_args: Record<string, unknown>, value: never): Array<{ type: 'text'; text: string }> => text(value)
@@ -44,7 +45,7 @@ export function forgeTools(deps: ModuleDeps): ToolDefinition[] {
       parameters: {
         type: 'object',
         properties: {
-          description: { type: 'string', description: 'Natural-language description of the DSH plugin to generate.' },
+          description: { type: 'string', maxLength: 12000, description: 'Natural-language description of the DSH plugin to generate (max 12,000 characters).' },
         },
         required: ['description'],
       },
@@ -74,11 +75,14 @@ export function forgeTools(deps: ModuleDeps): ToolDefinition[] {
         const record = await deps.store.get(id)
         if (!record) return neutralizeDeep({ ok: false, error: 'record not found: ' + id })
         const result = validatePlugin(record.files)
+        const contentSha256 = pluginContentDigest(record.files)
+        const testIsFresh = !!contentSha256 && result.valid && record.test?.passed === true && record.test.contentSha256 === contentSha256
         await deps.store.update(id, {
-          status: result.valid ? 'validated' : 'failed',
-          validation: { ...result, checkedAt: new Date().toISOString() },
+          status: result.valid ? (testIsFresh ? 'tested' : 'validated') : 'failed',
+          validation: { ...result, checkedAt: new Date().toISOString(), ...(contentSha256 ? { contentSha256 } : {}) },
+          test: testIsFresh ? record.test : undefined,
         })
-        return neutralizeDeep({ ok: true, ...result, recordId: id })
+        return neutralizeDeep({ ok: true, ...result, recordId: id, ...(contentSha256 ? { contentSha256 } : {}) })
       },
     } as never),
 
@@ -96,12 +100,23 @@ export function forgeTools(deps: ModuleDeps): ToolDefinition[] {
         const id = typeof a.id === 'string' ? a.id : ''
         const record = await deps.store.get(id)
         if (!record) return neutralizeDeep({ ok: false, error: 'record not found: ' + id })
-        if (!record.validation?.valid) return neutralizeDeep({ ok: false, error: 'static validation must pass before testing (run forge_validate)' })
+        const contentSha256 = pluginContentDigest(record.files)
+        if (!record.validation?.valid || !contentSha256 || record.validation.contentSha256 !== contentSha256) {
+          return neutralizeDeep({ ok: false, error: 'static validation evidence is missing or stale; rerun forge_validate' })
+        }
+        const rechecked = validatePlugin(record.files)
+        if (!rechecked.valid) return neutralizeDeep({ ok: false, error: 'current plugin contents fail validation: ' + rechecked.errors.slice(0, 5).join('; ') })
         const cfg = deps.cfg().forge
         if (!cfg.sandbox.enabled) return neutralizeDeep({ ok: false, error: 'sandbox is disabled in config (forge.sandbox.enabled=false)' })
-        const result = await testInSandbox(deps, record.files, cfg.sandbox.timeoutMs)
-        await deps.store.update(id, { status: result?.passed ? 'tested' : 'failed', test: result ?? undefined })
-        return neutralizeDeep({ ok: true, test: result, recordId: id })
+        try {
+          const result = await testInSandbox(deps, record.files, cfg.sandbox.timeoutMs)
+          const test = { ...result, contentSha256 }
+          await deps.store.update(id, { status: result.passed ? 'tested' : 'failed', test })
+          return neutralizeDeep({ ok: true, test, recordId: id })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          return neutralizeDeep({ ok: false, error: 'sandbox test failed: ' + message })
+        }
       },
     } as never),
 
@@ -212,7 +227,17 @@ export function forgeTools(deps: ModuleDeps): ToolDefinition[] {
         const id = typeof a.id === 'string' ? a.id : ''
         const record = await deps.store.get(id)
         if (!record) return neutralizeDeep({ ok: false, error: 'record not found: ' + id })
-        if (!record.validation?.valid) return neutralizeDeep({ ok: false, error: 'record must pass forge_validate before submission packet is built' })
+        const contentSha256 = pluginContentDigest(record.files)
+        if (!record.validation?.valid || !contentSha256 || record.validation.contentSha256 !== contentSha256) {
+          return neutralizeDeep({ ok: false, error: 'record must pass forge_validate for its current contents before submission' })
+        }
+        const currentValidation = validatePlugin(record.files)
+        if (!currentValidation.valid) {
+          return neutralizeDeep({ ok: false, error: 'current plugin contents fail validation: ' + currentValidation.errors.slice(0, 5).join('; ') })
+        }
+        if (!record.test?.passed || record.test.contentSha256 !== contentSha256) {
+          return neutralizeDeep({ ok: false, error: 'record must pass forge_test for its current contents before submission' })
+        }
         const listing = buildSubmissionListing(record, {
           developerName: typeof a.developerName === 'string' ? a.developerName : undefined,
           category: typeof a.category === 'string' ? a.category : undefined,
