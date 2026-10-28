@@ -97,7 +97,7 @@ describe('post-merge hardening assurance', () => {
       expect(await readdir(join(root, 'installed'))).not.toContain(record.id)
       const persisted = await store.get(record.id)
       expect(persisted?.operation).toBeUndefined()
-      expect(persisted?.status).toBe('tested')
+      expect(persisted?.status).toBe('generated')
     } finally {
       store.update = originalUpdate
     }
