@@ -13,7 +13,7 @@ This Skill mirrors the OpenAI/Codex Plugin Autopilot discipline but is adapted t
 - registry row lives in `cordis.patch.yml` (`- insert: [{ id, name, config }]`)
 - entry point is a TypeScript module exporting `apply(ctx, config)` (built to `lib/index.js`)
 - tools are registered via `ctx.tools.register(def)` with a lossless-JSON return contract
-- settings are registered via `ctx.settings.register(ns, schema, { applies: 'live' })`
+- DSH 0.1.7+ generates settings forms from exported `Config`; mark live-editable fields `.volatile()` and read them with `.get()` (legacy `ctx.settings.register` is only an older-host fallback)
 - activation uses `ctx.plugin(module, config)` and `ctx.provide(name, value)`
 - there is **no marketplace approval** — a locally validated ZIP is not a public marketplace listing
 
