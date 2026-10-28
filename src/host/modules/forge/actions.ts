@@ -3,7 +3,7 @@
 // retry on empty output), fail-closed static validation, sandboxed test
 // (process-group timeout), gated install, activation, export, submission.
 
-import { join, dirname, resolve, isAbsolute, relative } from 'node:path'
+import { join, dirname, resolve, isAbsolute } from 'node:path'
 import { createHash } from 'node:crypto'
 import { mkdir, writeFile, rm, mkdtemp, access, lstat } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
