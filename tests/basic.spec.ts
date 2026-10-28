@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { ForgeStore } from '../src/host/store.ts'
 import { resolveConfig } from '../src/host/config.ts'
 import { forgeTools } from '../src/host/modules/forge/tools.ts'
-import { validatePlugin, testInSandbox } from '../src/host/modules/forge/actions.ts'
+import { validatePlugin, testInSandbox, pluginContentDigest } from '../src/host/modules/forge/actions.ts'
 import type { ModuleDeps } from '../src/host/types.ts'
 import type { HostContextShape } from '../src/host/dsh.ts'
 
@@ -125,7 +125,7 @@ describe('dsh-forge smoke', () => {
 
   it('validate accepts well-formed plugin', () => {
     const result = validatePlugin([
-      { path: 'package.json', content: '{"name":"x","version":"1.0.0","type":"module","main":"lib/index.js","exports":{".":"./lib/index.js"},"dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}' },
+      { path: 'package.json', content: '{"name":"x","version":"1.0.0","type":"module","main":"lib/index.js","exports":{".":"./lib/index.js"},"dsh":{"bundle":{"patch":"./cordis.patch.yml"},"engines":{"dsh":">=0.1.1-rc.1"}}}' },
       { path: 'cordis.patch.yml', content: '- insert:\n    - id: x\n      name: x\n      config: {}' },
       { path: 'src/index.js', content: 'export function apply(ctx) { ctx.tools.register({ name: "t", description: "d", parameters: {}, output: { schema: {}, render: () => [] }, execute: async () => ({}) }) }' },
       { path: 'lib/index.js', content: 'export function apply(ctx) { ctx.tools.register({ name: "t", description: "d", parameters: {}, output: { schema: {}, render: () => [] }, execute: async () => ({}) }) }' },
@@ -214,6 +214,49 @@ describe('path and package hardening', () => {
     ])
     expect(result.valid).toBe(false)
     expect(result.errors.join(' ')).toMatch(/main|exports|match/i)
+  })
+})
+
+describe('hardening regressions', () => {
+  it('rejects a fake apply export hidden in a comment', () => {
+    const pkg = '{"name":"x","version":"1.0.0","type":"module","main":"lib/index.js","exports":{".":"./lib/index.js"},"dsh":{"bundle":{"patch":"./cordis.patch.yml"},"engines":{"dsh":">=0.1.1-rc.1"}}}'
+    const code = '// export function apply(ctx) { ctx.tools.register({ name: "fake" }) }\nexport const value = 1'
+    const result = validatePlugin([
+      { path: 'package.json', content: pkg },
+      { path: 'cordis.patch.yml', content: '- insert:\n    - id: x\n      name: x\n      config: {}' },
+      { path: 'src/index.js', content: code },
+      { path: 'lib/index.js', content: code },
+    ])
+    expect(result.valid).toBe(false)
+    expect(result.errors.join(' ')).toMatch(/apply|register/i)
+  })
+
+  it('rejects malformed file collections without throwing', () => {
+    expect(validatePlugin(null).valid).toBe(false)
+    expect(validatePlugin([null]).errors.join(' ')).toMatch(/file must be an object/i)
+    expect(validatePlugin([{ path: 'x.js', content: 42 }]).errors.join(' ')).toMatch(/string path and content/i)
+  })
+
+  it('rejects file-versus-directory path collisions', () => {
+    const pkg = '{"name":"x","version":"1.0.0","type":"module","main":"lib/index.js","exports":{".":"./lib/index.js"},"dsh":{"bundle":{"patch":"./cordis.patch.yml"},"engines":{"dsh":">=0.1.1-rc.1"}}}'
+    const entry = 'export function apply(ctx) { ctx.tools.register({ name: "t" }) }'
+    const result = validatePlugin([
+      { path: 'package.json', content: pkg },
+      { path: 'cordis.patch.yml', content: '- insert:\n    - id: x\n      name: x\n      config: {}' },
+      { path: 'src/index.js', content: entry },
+      { path: 'lib/index.js', content: entry },
+      { path: 'assets', content: 'file' },
+      { path: 'assets/logo.svg', content: 'child' },
+    ])
+    expect(result.valid).toBe(false)
+    expect(result.errors.join(' ')).toMatch(/path conflicts/i)
+  })
+
+  it('binds test evidence to stable content digests', () => {
+    const original = [{ path: 'a.js', content: 'a' }, { path: 'b.js', content: 'b' }]
+    expect(pluginContentDigest(original)).toBe(pluginContentDigest([...original].reverse()))
+    expect(pluginContentDigest(original)).not.toBe(pluginContentDigest([{ path: 'a.js', content: 'changed' }, original[1]]))
+    expect(pluginContentDigest([{ path: 'a.js', content: 1 }])).toBeNull()
   })
 })
 
