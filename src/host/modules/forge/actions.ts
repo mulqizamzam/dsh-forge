@@ -891,11 +891,6 @@ export async function uninstallPlugin(
 type ActivePlugin = { fiber: { dispose?: () => unknown; state?: unknown; inertia?: Promise<unknown> }; activePath: string; disposed?: boolean }
 const activeFibers = new Map<string, ActivePlugin>()
 
-  } finally {
-    endLifecycleOperation(id)
-  }
-}
-
 export async function activatePlugin(
   deps: ModuleDeps,
   id: string,
