@@ -65,7 +65,7 @@ export async function apply(rawContext, rawConfig = {}) {
 | Verb ↕▾ | Purpose ↕▾ | Returns ↕▾ |
 |---|---|---|
 | −`ctx.tools.register(def)` | Register a tool | void |
-| −`ctx.settings.register(ns, schema, { base, applies: 'live' | 'restart' })` | Register a live-writable settings scope | `{ get(): T }` |
+| `ctx.settings.describe/update/mutate` | Modern host settings service; forms are derived from each entry's exported `Config` schema | Descriptors / promises |
 | −`ctx.on(name, listener)` | Subscribe to a host event | disposer function |
 | −`ctx.get(name)` | Optional lookup of a host service | `unknown` |
 | −`ctx.effect(callback)` | Register a side effect scoped to the plugin fiber | disposer |
@@ -104,26 +104,20 @@ The host snapshots every tool return value with `snapshotJsonValue`. Rejects:
 
 A rejected return fails the entire tool call with `value is not lossless JSON`. Use `neutralizeDeep` (see `src/lib/sanitize.ts`) on every return.
 
-## Config — `schemastery`
+## Config — modern DSH per-entry settings
 
 ```
-import z from 'schemastery'
+import Schema from '@deepseek-ai/schemastery'
 
-export const Config = z.object({
-  enabled: z.boolean().default(true),
-  stateRoot: z.string().default(''),
+export const Config = Schema.object({
+  stateRoot: Schema.string().default(''), // ordinary config; requires restart
+  enabled: Schema.boolean().default(true).volatile(),
 })
-
-export function resolveConfig(raw: unknown): ResolvedConfig {
-  return Config(raw) as ResolvedConfig  // THROWS on malformed input
-}
 ```
 
-Do not silently fall back to defaults. If boot needs to tolerate bad config, catch the throw and register a degraded status tool.
+Since DSH 0.1.7, the host derives the settings form from the entry's exported `Config` schema. Fields marked `.volatile()` become live-editable `Volatile<T>` references; read their current values through `.get()` at the point of use. The `@deepseek-ai/schemastery` dependency must implement `.volatile()` (this repository uses `~3.18.4`). Keep restart-only fields such as `stateRoot` non-volatile.
 
-## Settings scope
-
-`ctx.settings.register(ns, Config, { base: rawConfig, applies: 'live' })` returns `{ get(): T }`. Reading `.get()` immediately resolves the effective config after the host applies its own overrides. Subscribe to `'settings/updated'` for live hot-swap.
+Legacy `ctx.settings.register()` / `settings/updated` support was removed in DSH 0.1.7. Avoid calling it on modern hosts; only retain a guarded fallback if older-host compatibility is required. Do not cache a one-time resolved snapshot when the host can update volatile references in place.
 
 ## Activation — `ctx.plugin`
 
