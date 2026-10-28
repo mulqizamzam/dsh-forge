@@ -17,14 +17,35 @@ export async function readJsonSafe(path: string): Promise<unknown> {
   finally { await handle?.close().catch(() => {}) }
 }
 
-/** Atomically replace a file and always remove the staging file on failure. */
+/** Atomic write: flush a private staged file, then rename over the destination. */
 async function atomicWrite(path: string, content: string, mode = 0o600): Promise<void> {
   await mkdir(dirname(path), { recursive: true })
+  const directory = dirname(path)
   const tmp = path + '.tmp.' + newId()
+  let handle: Awaited<ReturnType<typeof open>> | undefined
   try {
-    await writeFile(tmp, content, { encoding: 'utf8', mode, flag: 'wx' })
+    handle = await open(tmp, 'wx', mode)
+    await handle.writeFile(content, 'utf8')
+    await handle.sync()
+    await handle.close()
+    handle = undefined
     await rename(tmp, path)
+
+    // POSIX filesystems can persist the rename by syncing the containing
+    // directory. Some platforms/filesystems do not support directory fsync,
+    // so this remains best-effort while file-content fsync is mandatory.
+    let directoryHandle: Awaited<ReturnType<typeof open>> | undefined
+    try {
+      directoryHandle = await open(directory, 'r')
+      await directoryHandle.sync()
+    } catch {
+      // The rename already committed atomically; unsupported directory fsync
+      // must not turn a committed write into a reported failure.
+    } finally {
+      await directoryHandle?.close().catch(() => {})
+    }
   } finally {
+    await handle?.close().catch(() => {})
     await unlink(tmp).catch(() => { /* rename already consumed it, or write never completed */ })
   }
 }
