@@ -1,6 +1,6 @@
 import { join, resolve, parse, relative, sep } from 'node:path'
 import { createHash } from 'node:crypto'
-import { mkdir, lstat, chmod, realpath } from 'node:fs/promises'
+import { mkdir, lstat, chmod, realpath, readdir } from 'node:fs/promises'
 import { readJsonSafe, writeJsonAtomic, listDir } from '../lib/fsx.ts'
 import { withFileLock } from '../lib/file-lock.ts'
 import { newId, isoDateTime, isSafeKey } from '../lib/ids.ts'
@@ -40,6 +40,58 @@ export class ForgeStore {
     }
     const keyHash = createHash('sha256').update(key).digest('hex').slice(0, 40)
     return withFileLock(join(lockDir, scope + '-' + keyHash + '.lock'), action, { timeoutMs })
+  }
+
+  /**
+   * Fail-closed package-name uniqueness check for one DSH profile. The caller
+   * must hold the profile lock so concurrent Forge installs cannot pass this
+   * scan simultaneously. Invalid existing records block mutation rather than
+   * being silently skipped.
+   */
+  async findProfilePackageConflict(
+    profile: string,
+    packageName: string,
+    exceptId: string,
+  ): Promise<{ conflictId: string | null; error?: string }> {
+    if (!/^[a-zA-Z0-9_-]{1,64}$/.test(profile) ||
+        !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(packageName) ||
+        !isSafeKey(exceptId)) {
+      return { conflictId: null, error: 'invalid profile, package name, or excluded record ID for conflict check' }
+    }
+    let entries: string[]
+    try { entries = await readdir(this.recordsDir()) }
+    catch (e) {
+      return { conflictId: null, error: 'could not enumerate Forge records for package-conflict checking: ' + (e instanceof Error ? e.message : String(e)) }
+    }
+    const recordFiles = entries.filter(name => /^[a-f0-9]{12}\.json$/.test(name))
+    if (recordFiles.length > 10_000) {
+      return { conflictId: null, error: 'record store exceeds the 10,000-record conflict scan limit; refusing install until reviewed' }
+    }
+    for (const fileName of recordFiles) {
+      const id = fileName.slice(0, 12)
+      if (id === exceptId) continue
+      const record = await this.get(id)
+      if (!record) return { conflictId: null, error: 'invalid Forge record encountered during package-conflict check: ' + fileName }
+      let existingPackageName = record.name
+      const pkg = record.files.find(file => file.path === 'package.json')
+      if (pkg) {
+        try {
+          const manifest = JSON.parse(pkg.content) as Record<string, unknown>
+          if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest) || typeof manifest.name !== 'string') {
+            return { conflictId: null, error: 'invalid package.json in existing record ' + id + '; refusing install until reviewed' }
+          }
+          existingPackageName = manifest.name
+        } catch {
+          return { conflictId: null, error: 'invalid package.json in existing record ' + id + '; refusing install until reviewed' }
+        }
+      }
+      const installedInProfile = record.install?.installed === true && record.install.profile === profile
+      const unfinishedInProfile = record.operation?.profile === profile
+      if ((installedInProfile || unfinishedInProfile) && existingPackageName === packageName) {
+        return { conflictId: id }
+      }
+    }
+    return { conflictId: null }
   }
 
   /** Reject symlinks in every existing path component, not just the leaf. */

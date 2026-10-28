@@ -891,6 +891,14 @@ async function installPluginUnlocked(
   if (!/^[a-z0-9][a-z0-9._-]{0,99}$/.test(packageName)) {
     return { ok: false, error: 'record contains an invalid package name; refusing to run dsh' }
   }
+  const conflict = await deps.store.findProfilePackageConflict(chosenProfile, packageName, id)
+  if (conflict.error) return { ok: false, error: conflict.error }
+  if (conflict.conflictId) {
+    return {
+      ok: false,
+      error: 'package ' + packageName + ' is already installed or has an unfinished operation in profile ' + chosenProfile + ' (record ' + conflict.conflictId + ')',
+    }
+  }
   let operation: ForgeOperation | undefined
   try {
     const materialized = await materializeInstallTree(deps, id, record.files)

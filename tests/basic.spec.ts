@@ -193,6 +193,45 @@ describe('dsh-forge install gate', () => {
   })
   afterEach(async () => { await rm(root, { recursive: true, force: true }) })
 
+  it('prevents two Forge records from installing the same package into one profile', async () => {
+    const first = await addValidatedTestedRecord(store, 'same-package')
+    const secondFiles = buildValidPluginFiles('same-package')
+    const second = await store.add({ name: 'different-record-name', description: 'duplicate package identity', files: secondFiles })
+    const secondValidation = validatePlugin(secondFiles)
+    expect(secondValidation.valid).toBe(true)
+    const secondDigest = pluginContentDigest(secondFiles)!
+    const checkedAt = new Date().toISOString()
+    await store.update(second.id, {
+      validation: { ...secondValidation, checkedAt, contentSha256: secondDigest },
+      test: { passed: true, exitCode: 0, stdout: 'OK', stderr: '', durationMs: 1, checkedAt, contentSha256: secondDigest },
+    })
+
+    const fakeBin = join(root, 'fake-dsh-bin')
+    await mkdir(fakeBin)
+    const callLog = join(root, 'dsh-calls.log')
+    await writeFile(join(fakeBin, 'dsh'), '#!/bin/sh\necho called >> "$FORGE_TEST_DSH_CALL_LOG"\nexit 0\n')
+    await chmod(join(fakeBin, 'dsh'), 0o700)
+    const priorPath = process.env.PATH
+    const priorLog = process.env.FORGE_TEST_DSH_CALL_LOG
+    try {
+      process.env.PATH = [fakeBin, priorPath].filter((part): part is string => !!part).join(delimiter)
+      process.env.FORGE_TEST_DSH_CALL_LOG = callLog
+      const installed = await installPlugin(makeDeps(store), first.id, 'web')
+      expect(installed.ok).toBe(true)
+      const duplicate = await installPlugin(makeDeps(store), second.id, 'web')
+      expect(duplicate.ok).toBe(false)
+      if (!duplicate.ok) expect(duplicate.error).toMatch(/already installed|unfinished operation/i)
+    } finally {
+      if (priorPath === undefined) delete process.env.PATH
+      else process.env.PATH = priorPath
+      if (priorLog === undefined) delete process.env.FORGE_TEST_DSH_CALL_LOG
+      else process.env.FORGE_TEST_DSH_CALL_LOG = priorLog
+    }
+    expect((await readFile(callLog, 'utf8')).trim().split(/\r?\n/)).toHaveLength(1)
+    expect((await store.get(first.id))?.install?.installed).toBe(true)
+    expect((await store.get(second.id))?.install?.installed).not.toBe(true)
+  })
+
   it('install refuses without validation', async () => {
     const record = await store.add({ name: 'test', description: 'd', files: [] })
     const { installPlugin } = await import('../src/host/modules/forge/actions.ts')
