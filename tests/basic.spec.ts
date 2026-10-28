@@ -759,3 +759,117 @@ describe('cross-process lock hardening', () => {
     expect(ran).toBe(true)
   })
 })
+
+describe('external DSH operation recovery', () => {
+  let root: string
+  let store: ForgeStore
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'forge-recovery-'))
+    store = new ForgeStore({ root })
+    await store.init()
+  })
+  afterEach(async () => { await rm(root, { recursive: true, force: true }) })
+
+  it('journals an ambiguous install failure and reconciles from observed DSH state', async () => {
+    const record = await addValidatedTestedRecord(store, 'install-journal')
+    const fakeBin = join(root, 'fake-dsh-bin')
+    await mkdir(fakeBin)
+    await writeFile(join(fakeBin, 'dsh'), '#!/bin/sh\necho simulated_failure >&2\nexit 19\n')
+    await chmod(join(fakeBin, 'dsh'), 0o700)
+
+    const priorPath = process.env.PATH
+    let result: Awaited<ReturnType<typeof installPlugin>>
+    try {
+      process.env.PATH = [fakeBin, priorPath].filter((part): part is string => !!part).join(delimiter)
+      result = await installPlugin(makeDeps(store), record.id, 'web')
+    } finally {
+      if (priorPath === undefined) delete process.env.PATH
+      else process.env.PATH = priorPath
+    }
+
+    expect(result.ok).toBe(false)
+    const journaled = await store.get(record.id)
+    expect(journaled?.status).toBe('recovery_required')
+    expect(journaled?.operation?.kind).toBe('install')
+    expect(journaled?.operation?.phase).toBe('prepared')
+
+    const reconciled = await reconcilePluginOperation(makeDeps(store), record.id, false)
+    expect(reconciled.ok).toBe(true)
+    const finalRecord = await store.get(record.id)
+    expect(finalRecord?.operation).toBeUndefined()
+    expect(finalRecord?.install).toBeUndefined()
+    expect(finalRecord?.status).toBe('tested')
+  })
+
+  it('reconciles an external install that succeeded when the final Forge write fails', async () => {
+    const record = await addValidatedTestedRecord(store, 'install-commit-failure')
+    const fakeBin = join(root, 'fake-dsh-bin')
+    await mkdir(fakeBin)
+    await writeFile(join(fakeBin, 'dsh'), '#!/bin/sh\necho simulated_success\nexit 0\n')
+    await chmod(join(fakeBin, 'dsh'), 0o700)
+
+    const priorPath = process.env.PATH
+    const originalUpdate = store.update.bind(store)
+    let result: Awaited<ReturnType<typeof installPlugin>>
+    store.update = async (id, patch) => {
+      if (patch.status === 'installed' && patch.install?.installed === true) return null
+      return originalUpdate(id, patch)
+    }
+    try {
+      process.env.PATH = [fakeBin, priorPath].filter((part): part is string => !!part).join(delimiter)
+      result = await installPlugin(makeDeps(store), record.id, 'web')
+    } finally {
+      store.update = originalUpdate
+      if (priorPath === undefined) delete process.env.PATH
+      else process.env.PATH = priorPath
+    }
+
+    expect(result.ok).toBe(false)
+    const journaled = await store.get(record.id)
+    expect(journaled?.status).toBe('recovery_required')
+    expect(journaled?.operation?.phase).toBe('external_succeeded')
+
+    const reconciled = await reconcilePluginOperation(makeDeps(store), record.id, true)
+    expect(reconciled.ok).toBe(true)
+    const finalRecord = await store.get(record.id)
+    expect(finalRecord?.status).toBe('installed')
+    expect(finalRecord?.install?.installed).toBe(true)
+    expect(finalRecord?.operation).toBeUndefined()
+  })
+
+  it('keeps an uninstall journal when DSH fails and preserves the observed installed state', async () => {
+    const record = await addValidatedTestedRecord(store, 'uninstall-journal')
+    const installPath = join(root, 'installed', record.id)
+    await store.update(record.id, {
+      status: 'installed',
+      install: { installed: true, profile: 'web', installPath, at: new Date().toISOString() },
+    })
+    const fakeBin = join(root, 'fake-dsh-bin')
+    await mkdir(fakeBin)
+    await writeFile(join(fakeBin, 'dsh'), '#!/bin/sh\necho simulated_remove_failure >&2\nexit 19\n')
+    await chmod(join(fakeBin, 'dsh'), 0o700)
+
+    const priorPath = process.env.PATH
+    let result: Awaited<ReturnType<typeof installPlugin>>
+    try {
+      process.env.PATH = [fakeBin, priorPath].filter((part): part is string => !!part).join(delimiter)
+      const { uninstallPlugin } = await import('../src/host/modules/forge/actions.ts')
+      result = await uninstallPlugin(makeDeps(store), record.id)
+    } finally {
+      if (priorPath === undefined) delete process.env.PATH
+      else process.env.PATH = priorPath
+    }
+    expect(result.ok).toBe(false)
+    const journaled = await store.get(record.id)
+    expect(journaled?.status).toBe('recovery_required')
+    expect(journaled?.operation?.kind).toBe('uninstall')
+
+    const reconciled = await reconcilePluginOperation(makeDeps(store), record.id, true)
+    expect(reconciled.ok).toBe(true)
+    const finalRecord = await store.get(record.id)
+    expect(finalRecord?.status).toBe('installed')
+    expect(finalRecord?.install?.installed).toBe(true)
+    expect(finalRecord?.operation).toBeUndefined()
+  })
+})
