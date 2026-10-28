@@ -144,7 +144,7 @@ async function boot(
   await store.init()
   log.info('state at ' + root)
 
-  const cfg = () => resolved
+  const cfg = () => readConfig()
   const deps: ModuleDeps = {
     ctx,
     cfg,
