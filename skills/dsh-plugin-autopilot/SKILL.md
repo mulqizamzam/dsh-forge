@@ -33,9 +33,10 @@ This Skill mirrors the OpenAI/Codex Plugin Autopilot discipline but is adapted t
     - no path traversal, no absolute paths, no symlinks, no hidden secrets
     - every `SKILL.md` is valid YAML frontmatter with non-empty `name` and `description`
 11. Install requires static validation AND a sandbox test to have passed. Never install unvalidated plugins — `dsh plugin add` mutates the user's real profile.
-12. Activation requires the same gates. Never mount code that has not been validated and sandbox-tested.
-13. Build the artifact deterministically. Two builds from the same source must have the same SHA-256.
-14. Report exact commit/version, hashes, executed tests, skipped checks, remote status, and residual warnings. Never claim "approved" or "published" from local validation alone.
+12. For Git-hosted packages with a `prepare` build, respect pnpm's build-script approval gate. Copy the entire `allowBuilds` key printed by pnpm into the selected profile's `pnpm-workspace.yaml`; Git/tarball artifacts may require an exact key containing the resolved commit URL, so do not assume a package-name-only key is sufficient. Pin the install to the same commit when approving an exact resolved artifact. Treat this as permission to execute package source on the user's machine during installation.
+13. Activation requires the same gates. Never mount code that has not been validated and sandbox-tested.
+14. Build the artifact deterministically. Two builds from the same source must have the same SHA-256.
+15. Report exact commit/version, hashes, executed tests, skipped checks, remote status, and residual warnings. Never claim "approved" or "published" from local validation alone.
 
 ## Package preflight
 
