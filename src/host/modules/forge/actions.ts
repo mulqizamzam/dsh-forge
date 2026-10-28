@@ -248,6 +248,29 @@ function validateSafeFileSet(filesInput: unknown): string | null {
   return null
 }
 
+/** Validate the runtime shape of a registered DSH tool before treating a sandbox run as successful. */
+export function validateRuntimeToolDefinition(value: unknown): { valid: true; name: string } | { valid: false; error: string } {
+  const isRecord = (v: unknown): v is Record<string, unknown> =>
+    !!v && typeof v === 'object' && !Array.isArray(v)
+  if (!isRecord(value)) return { valid: false, error: 'tool definition must be an object' }
+  if (typeof value.name !== 'string' || !/^[A-Za-z][A-Za-z0-9_-]{0,127}$/.test(value.name)) {
+    return { valid: false, error: 'tool name must be a valid identifier (1–128 characters)' }
+  }
+  if (typeof value.description !== 'string' || value.description.trim() === '' || value.description.length > 12_000) {
+    return { valid: false, error: 'tool description must be a non-empty string of at most 12,000 characters' }
+  }
+  if (!isRecord(value.parameters) || value.parameters.type !== 'object') {
+    return { valid: false, error: 'tool parameters must be a JSON object schema with type="object"' }
+  }
+  if (!isRecord(value.output) || !isRecord(value.output.schema) || typeof value.output.render !== 'function') {
+    return { valid: false, error: 'tool output must include an object schema and a render function' }
+  }
+  if (typeof value.execute !== 'function') {
+    return { valid: false, error: 'tool execute must be a function' }
+  }
+  return { valid: true, name: value.name }
+}
+
 /** Remove comments and string/template literals before conservative source checks. */
 function stripJavaScriptCommentsAndLiterals(source: string): string {
   const out = source.split('')
@@ -570,8 +593,26 @@ const entryUrl = pathToFileURL(${JSON.stringify(entry)}).href
 const mod = await import(entryUrl)
 if (typeof mod.apply !== 'function') { console.error('NO_APPLY_EXPORT'); process.exit(3) }
 const registered = []
+const seenNames = new Set()
+const registrationErrors = []
+const isRecord = (v) => !!v && typeof v === 'object' && !Array.isArray(v)
+const validateTool = (d) => {
+  if (!isRecord(d)) return 'tool definition must be an object'
+  if (typeof d.name !== 'string' || !/^[A-Za-z][A-Za-z0-9_-]{0,127}$/.test(d.name)) return 'tool name must be a valid identifier'
+  if (typeof d.description !== 'string' || d.description.trim() === '' || d.description.length > 12000) return 'tool description must be non-empty and at most 12000 characters'
+  if (!isRecord(d.parameters) || d.parameters.type !== 'object') return 'tool parameters must be a JSON object schema with type="object"'
+  if (!isRecord(d.output) || !isRecord(d.output.schema) || typeof d.output.render !== 'function') return 'tool output must include an object schema and a render function'
+  if (typeof d.execute !== 'function') return 'tool execute must be a function'
+  return null
+}
 const fakeCtx = {
-  tools: { register: (d) => { if (d && typeof d.name === 'string') registered.push(d.name) } },
+  tools: { register: (d) => {
+    const error = validateTool(d)
+    if (error) { registrationErrors.push(error); return }
+    if (seenNames.has(d.name)) { registrationErrors.push('duplicate tool name: ' + d.name); return }
+    seenNames.add(d.name)
+    registered.push(d.name)
+  } },
   settings: { writable: true, register: () => ({ get: () => ({}) }) },
   get: () => undefined,
   on: () => () => {},
@@ -579,8 +620,9 @@ const fakeCtx = {
 }
 try { await mod.apply(fakeCtx, {}) }
 catch (e) { console.error('APPLY_THREW: ' + (e && e.message ? e.message : String(e))); process.exit(4) }
+if (registrationErrors.length > 0) { console.error('INVALID_TOOL_REGISTRATION: ' + registrationErrors.join('; ')); process.exit(6) }
 if (registered.length === 0) { console.error('NO_TOOLS_REGISTERED'); process.exit(5) }
-console.log('OK_TOOLS:' + registered.join(','))
+console.log('FORGE_SANDBOX_RESULT:OK:' + registered.join(','))
 `, 'utf8')
 
     const bwrapArgs: string[] = [
@@ -588,6 +630,8 @@ console.log('OK_TOOLS:' + registered.join(','))
       '--unshare-user',
       '--unshare-pid',
       '--unshare-net',
+      // Bound memory-backed filesystems so generated code cannot fill host /tmp or rootfs.
+      '--size', '67108864',
       '--tmpfs', '/',
     ]
     // Build an allowlisted, read-only system view. Never mount the host's whole
@@ -617,9 +661,10 @@ console.log('OK_TOOLS:' + registered.join(','))
 
     bwrapArgs.push(
       '--dir', '/tmp',
+      '--size', '16777216',
       '--tmpfs', '/tmp',
       '--dir', workDir,
-      '--bind', workDir, workDir,
+      '--ro-bind', workDir, workDir,
       '--dir', '/proc',
       '--proc', '/proc',
       '--dir', '/dev',
@@ -634,13 +679,21 @@ console.log('OK_TOOLS:' + registered.join(','))
       bwrapArgs.push('--ro-bind', nodeBinary, '/tmp/node')
     }
 
+    // Rootfs and candidate source tree are read-only; /tmp is a bounded 16 MiB tmpfs.
+    // Limit process count and CPU time before evaluating generated plugin code.
     bwrapArgs.push(
-      '/bin/sh', '-c', 'node .forge-test.mjs',
+      '--remount-ro', '/',
+      '--remount-ro', workDir,
+      '--remount-ro', '/proc',
+      '--remount-ro', '/dev',
+      '/bin/sh', '-c',
+      'set -eu; nproc=$(ulimit -Hu); if [ "$nproc" = unlimited ] || [ "$nproc" -gt 64 ]; then ulimit -Hu 64; nproc=64; fi; ulimit -Su "$nproc"; cpu=$(ulimit -Ht); if [ "$cpu" = unlimited ] || [ "$cpu" -gt 60 ]; then ulimit -Ht 60; cpu=60; fi; ulimit -St "$cpu"; exec node .forge-test.mjs',
     )
 
     const r = await spawnProcess('bwrap', bwrapArgs, { timeoutMs })
+    const lastOutputLine = r.stdout.trimEnd().split(/\\r?\\n/).slice(-1)[0] ?? ''
     return {
-      passed: r.exitCode === 0 && r.stdout.includes('OK_TOOLS:'),
+      passed: r.exitCode === 0 && lastOutputLine.startsWith('FORGE_SANDBOX_RESULT:OK:'),
       exitCode: r.exitCode,
       stdout: r.stdout.slice(0, 10_000),
       stderr: r.stderr.slice(0, 10_000),
