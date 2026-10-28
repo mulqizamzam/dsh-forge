@@ -12,6 +12,7 @@ export interface ForgeStoreOptions {
 export class ForgeStore {
   private readonly root: string
   private readonly nowFn: () => Date
+  private readonly recordLocks = new Map<string, Promise<void>>()
 
   constructor(opts: ForgeStoreOptions) {
     this.root = opts.root
@@ -96,13 +97,24 @@ export class ForgeStore {
     return value as ForgeRecord
   }
 
+  /** Serialize record updates in this process so patches cannot overwrite each other. */
   async update(id: string, patch: Partial<ForgeRecord>): Promise<ForgeRecord | null> {
     if (!isSafeKey(id)) return null
-    const existing = await this.get(id)
-    if (!existing) return null
-    const updated: ForgeRecord = { ...existing, ...patch, id, updatedAt: isoDateTime(this.nowFn()) }
-    await writeJsonAtomic(join(this.recordsDir(), `${id}.json`), updated)
-    return updated
+    const previous = this.recordLocks.get(id) ?? Promise.resolve()
+    let release!: () => void
+    const current = new Promise<void>(resolve => { release = resolve })
+    this.recordLocks.set(id, current)
+    await previous
+    try {
+      const existing = await this.get(id)
+      if (!existing) return null
+      const updated: ForgeRecord = { ...existing, ...patch, id, updatedAt: isoDateTime(this.nowFn()) }
+      await writeJsonAtomic(join(this.recordsDir(), `${id}.json`), updated)
+      return updated
+    } finally {
+      release()
+      if (this.recordLocks.get(id) === current) this.recordLocks.delete(id)
+    }
   }
 
   async list(limit = 50): Promise<ForgeRecord[]> {
