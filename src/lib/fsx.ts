@@ -11,22 +11,29 @@ export async function readJsonSafe(path: string): Promise<unknown> {
   } catch { return null }
 }
 
-/** Atomic JSON write: write tmp then rename. Unique tmp name per call. */
-export async function writeJsonAtomic(path: string, data: unknown): Promise<void> {
+/** Atomically replace a file and always remove the staging file on failure. */
+async function atomicWrite(path: string, content: string, mode = 0o600): Promise<void> {
   await mkdir(dirname(path), { recursive: true })
   const tmp = path + '.tmp.' + newId()
-  await writeFile(tmp, JSON.stringify(data, null, 2) + '\n', 'utf8')
-  const { rename } = await import('node:fs/promises')
-  await rename(tmp, path)
+  try {
+    await writeFile(tmp, content, { encoding: 'utf8', mode, flag: 'wx' })
+    const { rename } = await import('node:fs/promises')
+    await rename(tmp, path)
+  } finally {
+    await unlink(tmp).catch(() => { /* rename already consumed it, or write never completed */ })
+  }
+}
+
+/** Atomic JSON write: stage privately, then rename over the destination. */
+export async function writeJsonAtomic(path: string, data: unknown): Promise<void> {
+  const serialized = JSON.stringify(data, null, 2)
+  if (serialized === undefined) throw new TypeError('cannot serialize undefined as a JSON record')
+  await atomicWrite(path, serialized + '\n')
 }
 
 /** Atomic text write. */
 export async function writeTextAtomic(path: string, content: string): Promise<void> {
-  await mkdir(dirname(path), { recursive: true })
-  const tmp = path + '.tmp.' + newId()
-  await writeFile(tmp, content, 'utf8')
-  const { rename } = await import('node:fs/promises')
-  await rename(tmp, path)
+  await atomicWrite(path, content)
 }
 
 /** List files in a dir, sorted by mtime descending. */
