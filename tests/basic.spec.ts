@@ -280,6 +280,51 @@ describe('dsh-forge install gate', () => {
     if (!result.ok) expect(result.error).toMatch(/validation/i)
   })
 
+  it('completes a mocked install activate deactivate uninstall lifecycle', async () => {
+    const record = await addValidatedTestedRecord(store, 'lifecycle-e2e')
+    const ctx = makeCtx()
+    let disposed = 0
+    ctx.plugin = (module: unknown) => {
+      const pluginModule = module as { apply?: (host: HostContextShape, config: unknown) => unknown }
+      pluginModule.apply?.(ctx, {})
+      return { state: 'ACTIVE', inertia: Promise.resolve(), dispose: () => { disposed++ } }
+    }
+    const deps = makeActivationEnabledDeps(store)
+    deps.ctx = ctx
+    const fakeBin = join(root, 'fake-dsh-bin')
+    await mkdir(fakeBin)
+    const callLog = join(root, 'dsh-calls.log')
+    await writeFile(join(fakeBin, 'dsh'), '#!/bin/sh\necho "$@" >> "$FORGE_TEST_DSH_CALL_LOG"\nexit 0\n')
+    await chmod(join(fakeBin, 'dsh'), 0o700)
+    const oldPath = process.env.PATH
+    const oldLog = process.env.FORGE_TEST_DSH_CALL_LOG
+    try {
+      process.env.PATH = [fakeBin, oldPath].filter((part): part is string => !!part).join(delimiter)
+      process.env.FORGE_TEST_DSH_CALL_LOG = callLog
+      expect((await installPlugin(deps, record.id, 'web')).ok).toBe(true)
+      expect((await activatePlugin(deps, record.id)).ok).toBe(true)
+      expect((await deactivatePlugin(deps, record.id)).ok).toBe(true)
+      const { uninstallPlugin } = await import('../src/host/modules/forge/actions.ts')
+      expect((await uninstallPlugin(deps, record.id)).ok).toBe(true)
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH
+      else process.env.PATH = oldPath
+      if (oldLog === undefined) delete process.env.FORGE_TEST_DSH_CALL_LOG
+      else process.env.FORGE_TEST_DSH_CALL_LOG = oldLog
+    }
+    const finalRecord = await store.get(record.id)
+    expect(finalRecord?.install).toBeUndefined()
+    expect(finalRecord?.active).toBeUndefined()
+    expect(finalRecord?.operation).toBeUndefined()
+    expect(finalRecord?.status).toBe('tested')
+    expect(disposed).toBe(1)
+    expect(await readdir(join(root, 'installed'))).not.toContain(record.id)
+    const calls = (await readFile(callLog, 'utf8')).trim().split(/\r?\n/)
+    expect(calls).toHaveLength(2)
+    expect(calls[0]).toContain('add')
+    expect(calls[1]).toContain('remove')
+  })
+
   it('disables in-process activation until explicitly opted in', async () => {
     const record = await addValidatedTestedRecord(store, 'activation-opt-in')
     const deps = makeDeps(store)
