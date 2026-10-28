@@ -797,10 +797,7 @@ export async function installPlugin(
   id: string,
   profile?: string,
 ): Promise<{ ok: true; installPath: string; profile: string } | { ok: false; error: string }> {
-  if (!beginLifecycleOperation(id)) {
-    return { ok: false, error: 'another lifecycle operation is already in progress for this record, or the record ID is invalid' }
-  }
-  try {  const record = await deps.store.get(id)
+  const record = await deps.store.get(id)
   if (!record) return { ok: false, error: 'record not found or invalid record ID: ' + id }
   if (activeFibers.has(id)) return { ok: false, error: 'deactivate the plugin before reinstalling it' }
   if (record.install?.installed) return { ok: false, error: 'plugin is already installed; uninstall it before reinstalling' }
@@ -838,10 +835,6 @@ export async function installPlugin(
   } catch (e) {
     return { ok: false, error: 'install failed: ' + (e instanceof Error ? e.message : String(e)) }
   }
-
-  } finally {
-    endLifecycleOperation(id)
-  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -852,10 +845,7 @@ export async function uninstallPlugin(
   deps: ModuleDeps,
   id: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  if (!beginLifecycleOperation(id)) {
-    return { ok: false, error: 'another lifecycle operation is already in progress for this record, or the record ID is invalid' }
-  }
-  try {  const record = await deps.store.get(id)
+  const record = await deps.store.get(id)
   if (!record) return { ok: false, error: 'record not found or invalid record ID: ' + id }
   if (activeFibers.has(id)) return { ok: false, error: 'deactivate the plugin before uninstalling it' }
   if (!record.install?.installed) return { ok: false, error: 'plugin is not installed' }
@@ -892,10 +882,6 @@ export async function uninstallPlugin(
   } catch (e) {
     return { ok: false, error: 'uninstall failed: ' + (e instanceof Error ? e.message : String(e)) }
   }
-
-  } finally {
-    endLifecycleOperation(id)
-  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -925,10 +911,7 @@ export async function activatePlugin(
   deps: ModuleDeps,
   id: string,
 ): Promise<{ ok: true; toolNames: string[] } | { ok: false; error: string }> {
-  if (!beginLifecycleOperation(id)) {
-    return { ok: false, error: 'another lifecycle operation is already in progress for this record, or the record ID is invalid' }
-  }
-  try {  const record = await deps.store.get(id)
+  const record = await deps.store.get(id)
   if (!record) return { ok: false, error: 'record not found or invalid record ID: ' + id }
   if (activeFibers.has(id)) return { ok: false, error: 'plugin is already active in this host' }
   const evidenceError = freshEvidenceError(record, { requireValidation: true, requireTest: true })
@@ -1037,20 +1020,13 @@ export async function activatePlugin(
     return { ok: false, error: 'mount failed: ' + mountError }
   }
   return { ok: true, toolNames: registered }
-
-  } finally {
-    endLifecycleOperation(id)
-  }
 }
 
 export async function deactivatePlugin(
   deps: ModuleDeps,
   id: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  if (!beginLifecycleOperation(id)) {
-    return { ok: false, error: 'another lifecycle operation is already in progress for this record, or the record ID is invalid' }
-  }
-  try {  if (!/^[a-f0-9]{12}$/.test(id)) return { ok: false, error: 'invalid record ID' }
+  if (!/^[a-f0-9]{12}$/.test(id)) return { ok: false, error: 'invalid record ID' }
   const active = activeFibers.get(id)
   if (!active) return { ok: false, error: 'plugin is not active in this host' }
   if (!active.disposed) {
@@ -1083,10 +1059,6 @@ export async function deactivatePlugin(
   }
   activeFibers.delete(id)
   return { ok: true }
-
-  } finally {
-    endLifecycleOperation(id)
-  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
