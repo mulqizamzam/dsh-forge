@@ -1,14 +1,20 @@
-import { readFile, writeFile, readdir, lstat, unlink, mkdir } from 'node:fs/promises'
+import { open, writeFile, readdir, lstat, unlink, mkdir, rename } from 'node:fs/promises'
+import { constants as fsConstants } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { newId } from './ids.ts'
 
-/** Read JSON safely; null on any error. */
+/** Read JSON safely without following a symlink at the final path component. */
 export async function readJsonSafe(path: string): Promise<unknown> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined
   try {
-    const metadata = await lstat(path)
-    if (!metadata.isFile() || metadata.isSymbolicLink()) return null
-    return JSON.parse(await readFile(path, 'utf8'))
+    // O_NOFOLLOW closes the lstat/readFile race where the platform supports it.
+    const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0)
+    handle = await open(path, flags)
+    const metadata = await handle.stat()
+    if (!metadata.isFile()) return null
+    return JSON.parse(await handle.readFile({ encoding: 'utf8' }))
   } catch { return null }
+  finally { await handle?.close().catch(() => {}) }
 }
 
 /** Atomically replace a file and always remove the staging file on failure. */
@@ -17,7 +23,6 @@ async function atomicWrite(path: string, content: string, mode = 0o600): Promise
   const tmp = path + '.tmp.' + newId()
   try {
     await writeFile(tmp, content, { encoding: 'utf8', mode, flag: 'wx' })
-    const { rename } = await import('node:fs/promises')
     await rename(tmp, path)
   } finally {
     await unlink(tmp).catch(() => { /* rename already consumed it, or write never completed */ })

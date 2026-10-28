@@ -1,5 +1,5 @@
 import { join, resolve, parse, relative, sep } from 'node:path'
-import { mkdir, lstat, chmod } from 'node:fs/promises'
+import { mkdir, lstat, chmod, realpath } from 'node:fs/promises'
 import { readJsonSafe, writeJsonAtomic, listDir } from '../lib/fsx.ts'
 import { newId, isoDateTime, isSafeKey } from '../lib/ids.ts'
 import type { ForgeRecord, PluginFile } from './types.ts'
@@ -21,8 +21,24 @@ export class ForgeStore {
 
   getRoot(): string { return this.root }
 
+  /** Reject symlinks in every existing path component, not just the leaf. */
+  private async assertPathHasNoSymlink(path: string): Promise<void> {
+    const absolute = resolve(path)
+    const filesystemRoot = parse(absolute).root
+    const parts = absolute.slice(filesystemRoot.length).split(sep).filter(Boolean)
+    let current = filesystemRoot
+    for (const part of parts) {
+      current = join(current, part)
+      const info = await lstat(current)
+      if (info.isSymbolicLink()) {
+        throw new Error('state path must not contain symlinks: ' + current)
+      }
+    }
+  }
+
   private async ensurePrivateDirectory(path: string): Promise<void> {
     await mkdir(path, { recursive: true, mode: 0o700 })
+    await this.assertPathHasNoSymlink(path)
     const info = await lstat(path)
     if (!info.isDirectory() || info.isSymbolicLink()) {
       throw new Error('state directory must be a real directory, not a symlink: ' + path)
@@ -50,9 +66,14 @@ export class ForgeStore {
     // files, or be intentionally shared. Only change permissions on our own
     // dedicated subdirectories.
     await mkdir(root, { recursive: true, mode: 0o700 })
+    await this.assertPathHasNoSymlink(root)
     const rootInfo = await lstat(root)
     if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
       throw new Error('stateRoot must be a real directory, not a symlink')
+    }
+    // Canonicalize after validation so later joins do not retain a lexical alias.
+    if (await realpath(root) !== root) {
+      throw new Error('stateRoot must not resolve through a non-canonical path')
     }
     for (const name of ['records', 'installed', 'exports']) {
       await this.ensurePrivateDirectory(join(root, name))

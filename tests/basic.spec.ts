@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile, symlink, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { ForgeStore } from '../src/host/store.ts'
-import { writeJsonAtomic } from '../src/lib/fsx.ts'
+import { readJsonSafe, writeJsonAtomic } from '../src/lib/fsx.ts'
 import { resolveConfig } from '../src/host/config.ts'
 import { forgeTools } from '../src/host/modules/forge/tools.ts'
 import { validatePlugin, testInSandbox, pluginContentDigest, validateRuntimeToolDefinition } from '../src/host/modules/forge/actions.ts'
@@ -444,5 +444,43 @@ describe('dsh-forge store', () => {
     await symlink(outside, join(root, 'records', 'abcdef123456.json'))
     expect(await store.get('abcdef123456')).toBeNull()
     expect(await store.list()).toHaveLength(0)
+  })
+})
+
+
+describe('symlink and TOCTOU hardening', () => {
+  let root: string
+  let outside: string
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'forge-safe-'))
+    outside = await mkdtemp(join(tmpdir(), 'forge-outside-'))
+  })
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true })
+    await rm(outside, { recursive: true, force: true })
+  })
+
+  it('readJsonSafe refuses a symlink instead of reading its target', async () => {
+    const target = join(outside, 'record.json')
+    const link = join(root, 'record.json')
+    await writeFile(target, JSON.stringify({ secret: true }))
+    await symlink(target, link)
+    expect(await readJsonSafe(link)).toBeNull()
+  })
+
+  it('store init rejects a state root reached through a symlinked parent', async () => {
+    const link = join(root, 'linked-parent')
+    await symlink(outside, link)
+    const store = new ForgeStore({ root: join(link, 'state') })
+    await expect(store.init()).rejects.toThrow(/symlink/i)
+  })
+
+  it('store init rejects a symlinked state root', async () => {
+    const link = join(root, 'state-link')
+    await symlink(outside, link)
+    const store = new ForgeStore({ root: link })
+    await expect(store.init()).rejects.toThrow(/symlink/i)
   })
 })
