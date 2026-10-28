@@ -979,6 +979,11 @@ async function uninstallPluginUnlocked(
   if (!/^[a-z0-9][a-z0-9._-]{0,99}$/.test(packageName)) {
     return { ok: false, error: 'record contains an invalid package name; refusing to run dsh' }
   }
+  const installedRoot = join(resolve(deps.store.getRoot()), 'installed')
+  const expectedInstallPath = containPath(installedRoot, id)
+  if (!expectedInstallPath || resolve(record.install.installPath) !== expectedInstallPath) {
+    return { ok: false, error: 'record install path is not the expected Forge-managed destination; refusing uninstall cleanup' }
+  }
   let operation: ForgeOperation | undefined
   try {
     const startedAt = new Date().toISOString()
@@ -987,7 +992,7 @@ async function uninstallPluginUnlocked(
       phase: 'prepared',
       profile,
       packageName,
-      installPath: record.install.installPath,
+      installPath: expectedInstallPath,
       startedAt,
       updatedAt: startedAt,
     }
@@ -1011,6 +1016,21 @@ async function uninstallPluginUnlocked(
     const externalSuccess = await deps.store.update(id, { status: 'uninstalling', operation })
     if (!externalSuccess) {
       return { ok: false, error: 'DSH uninstall succeeded but the journal phase could not be saved; inspect the profile and run forge_reconcile' }
+    }
+    const installedRootInfo = await lstat(installedRoot).catch(() => null)
+    const installTreeInfo = await lstat(expectedInstallPath).catch(() => null)
+    if (!installedRootInfo || !installedRootInfo.isDirectory() || installedRootInfo.isSymbolicLink() ||
+        (installTreeInfo && (!installTreeInfo.isDirectory() || installTreeInfo.isSymbolicLink()))) {
+      operation = { ...operation, updatedAt: new Date().toISOString() }
+      await deps.store.update(id, { status: 'recovery_required', operation }).catch(() => null)
+      return { ok: false, error: 'DSH removed the plugin, but its local install path is missing or unsafe; inspect and run forge_reconcile with observedInstalled=false' }
+    }
+    try {
+      if (installTreeInfo) await rm(expectedInstallPath, { recursive: true, force: false })
+    } catch (cleanupError) {
+      operation = { ...operation, updatedAt: new Date().toISOString() }
+      await deps.store.update(id, { status: 'recovery_required', operation }).catch(() => null)
+      return { ok: false, error: 'DSH removed the plugin, but the local install tree could not be cleaned; inspect and run forge_reconcile with observedInstalled=false: ' + (cleanupError instanceof Error ? cleanupError.message : String(cleanupError)) }
     }
     const status = statusAfterUninstall(record)
     const updated = await deps.store.update(id, { status, install: undefined, active: undefined, operation: undefined })
