@@ -914,7 +914,20 @@ async function installPluginUnlocked(
       updatedAt: startedAt,
     }
     const journaled = await deps.store.update(id, { status: 'installing', operation })
-    if (!journaled) return { ok: false, error: 'could not persist install journal; DSH was not invoked' }
+    if (!journaled) {
+      // The DSH command has not been invoked. Do not leave a published install
+      // tree with no operation journal, because forge_reconcile cannot own it.
+      try {
+        await rm(materialized.installPath, { recursive: true, force: false })
+      } catch (cleanupError) {
+        return {
+          ok: false,
+          error: 'could not persist install journal; DSH was not invoked, but the local install tree needs manual cleanup at ' +
+            materialized.installPath + ': ' + (cleanupError instanceof Error ? cleanupError.message : String(cleanupError)),
+        }
+      }
+      return { ok: false, error: 'could not persist install journal; DSH was not invoked and the local install tree was cleaned' }
+    }
 
     const r = await spawnProcess('dsh', ['plugin', '--profile', chosenProfile, 'add', materialized.installPath], { timeoutMs: 60_000 })
     const output = (r.stdout + '\n' + r.stderr).trim()
