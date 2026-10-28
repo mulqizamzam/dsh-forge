@@ -159,7 +159,7 @@ export function forgeTools(deps: ModuleDeps): ToolDefinition[] {
 
     defineTool({
       name: 'forge_activate',
-      description: 'Mount a validated + tested plugin into the currently-running host via ctx.plugin. Requires forge_validate and forge_test to have passed. Unmount with forge_deactivate.',
+      description: 'Execute a validated + tested plugin inside the current DSH host process via ctx.plugin. This runs candidate code with host-process privileges and is disabled unless forge.activation.allowInProcessExecution=true is explicitly configured. Unmount with forge_deactivate.',
       parameters: {
         type: 'object',
         properties: { id: { type: 'string', description: 'Record ID.' } },

@@ -91,9 +91,13 @@ Example plugin configuration:
       install:
         requireValidated: true
         requireTested: true
+      activation:
+        allowInProcessExecution: false
 ```
 
-Keep both install gates enabled. Setting either `requireValidated` or `requireTested` to `false` permits code to be installed or activated without that check. Only do so in a disposable environment when you understand the consequences.
+Keep both install gates enabled. Setting either `requireValidated` or `requireTested` to `false` permits code to be installed or activated without that check.
+
+**In-process activation is disabled by default.** `forge_test` runs the candidate under Bubblewrap, but `forge_activate` imports the candidate and executes it in the running DSH host process. Sandbox success does not constrain that runtime. Only after reviewing and trusting the plugin source, explicitly set `forge.activation.allowInProcessExecution: true` in the DSH plugin config to enable activation. This is a trust opt-in, not a sandbox or permission boundary.
 
 ## How the safety gates work
 

@@ -51,7 +51,7 @@ function buildValidPluginFiles(name: string): Array<{ path: string; content: str
       main: 'lib/index.js', exports: { '.': './lib/index.js' },
       dsh: { bundle: { patch: './cordis.patch.yml' }, engines: { dsh: '>=0.1.1-rc.1' } },
     }) },
-    { path: 'cordis.patch.yml', content: `- insert:\\n    - id: ${name}\\n      name: ${name}\\n      config: {}` },
+    { path: 'cordis.patch.yml', content: `- insert:\n    - id: ${name}\n      name: ${name}\n      config: {}` },
     { path: 'src/index.js', content: entry },
     { path: 'lib/index.js', content: entry },
   ]

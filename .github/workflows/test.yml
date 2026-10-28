@@ -47,5 +47,11 @@ jobs:
         run: npm test
       - name: Type check
         run: npm run typecheck
+      - name: Build and verify installable package
+        run: |
+          npm run build
+          node --input-type=module -e 'import assert from "node:assert/strict"; import { existsSync, readFileSync } from "node:fs"; const pkg = JSON.parse(readFileSync("package.json", "utf8")); assert.ok(existsSync(pkg.main), "package main entry must exist after build"); const mod = await import("./" + pkg.main); assert.equal(typeof mod.apply, "function", "built entry must export apply");'
+          npm pack --dry-run --json > /tmp/dsh-forge-pack.json
+          node --input-type=module -e 'import assert from "node:assert/strict"; import { readFileSync } from "node:fs"; const report = JSON.parse(readFileSync("/tmp/dsh-forge-pack.json", "utf8")); assert.equal(report.length, 1); assert.ok(report[0].files.some(file => file.path === "lib/index.js"), "published package must contain lib/index.js");'
       - name: Validate DSH plugin contract
         run: npm run validate

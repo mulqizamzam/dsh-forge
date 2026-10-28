@@ -42,6 +42,8 @@ DSH plugin contract (authoritative):
 - lib/index.js is the runtime entry and MUST contain the same executable ESM implementation as src/index.js.
 - package.json main MUST be "lib/index.js" and exports["."] MUST be "./lib/index.js".
 - No TypeScript build step is permitted. Files must be plain .js ESM.
+- Plugin packages MUST be self-contained: do not declare package.json scripts or dependencies/optionalDependencies/devDependencies/peerDependencies.
+  Install lifecycle scripts and dependency postinstall hooks run outside forge_test's sandbox and are not permitted.
 
 Rules:
 - All content values are JSON strings; escape quotes and newlines correctly.
@@ -246,6 +248,29 @@ function validateSafeFileSet(filesInput: unknown): string | null {
     totalBytes += bytes
     if (totalBytes > MAX_PLUGIN_BYTES) return 'plugin exceeds 5 MiB total content limit'
     if (paths.some((other, j) => j !== i && other.startsWith(key + '/'))) return 'file path conflicts with a directory path: ' + file.path
+  }
+  const packageFile = files.find(file => file.path === 'package.json')
+  if (packageFile) {
+    let manifest: Record<string, unknown>
+    try {
+      manifest = JSON.parse(packageFile.content) as Record<string, unknown>
+      if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) return 'package.json root must be an object'
+    } catch {
+      return 'package.json is not valid JSON'
+    }
+    if (manifest.scripts !== undefined) {
+      if (!manifest.scripts || typeof manifest.scripts !== 'object' || Array.isArray(manifest.scripts) ||
+          Object.keys(manifest.scripts as Record<string, unknown>).length > 0) {
+        return 'package.json scripts are not permitted; package lifecycle scripts execute outside the sandbox'
+      }
+    }
+    for (const field of ['dependencies', 'optionalDependencies', 'devDependencies', 'peerDependencies', 'bundledDependencies']) {
+      const value = manifest[field]
+      if (value !== undefined && (!value || typeof value !== 'object' || Array.isArray(value) ||
+          Object.keys(value as Record<string, unknown>).length > 0)) {
+        return 'package.json ' + field + ' are not permitted; generated plugins must be self-contained'
+      }
+    }
   }
   return null
 }
@@ -782,6 +807,17 @@ async function materializeInstallTree(
   }
 }
 
+function packageNameFor(record: ForgeRecord): string {
+  const pkg = record.files.find(file => file.path === 'package.json')
+  if (pkg) {
+    try {
+      const parsed = JSON.parse(pkg.content) as Record<string, unknown>
+      if (typeof parsed.name === 'string') return parsed.name
+    } catch { /* rejected by safety gate when malformed */ }
+  }
+  return record.name
+}
+
 function freshEvidenceError(
   record: ForgeRecord,
   options: { requireValidation: boolean; requireTest: boolean },
@@ -956,6 +992,12 @@ async function activatePluginUnlocked(
   if (evidenceError) return { ok: false, error: 'cannot activate: ' + evidenceError }
   const safetyError = validateSafeFileSet(record.files)
   if (safetyError) return { ok: false, error: safetyError }
+  if (deps.cfg().forge.activation.allowInProcessExecution !== true) {
+    return {
+      ok: false,
+      error: 'in-process plugin execution is disabled by default; review the plugin source and explicitly set forge.activation.allowInProcessExecution=true to opt in',
+    }
+  }
 
   const ctx = deps.ctx
   if (typeof ctx.plugin !== 'function') {
