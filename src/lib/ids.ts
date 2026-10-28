@@ -10,7 +10,7 @@ export function isoDateTime(d?: Date): string {
   return (d ?? new Date()).toISOString()
 }
 
-/** Validate a key is safe for filesystem use. */
+/** Validate a generated record ID before using it in a filesystem path. */
 export function isSafeKey(key: string): boolean {
-  return /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(key)
+  return /^[a-f0-9]{12}$/.test(key)
 }
