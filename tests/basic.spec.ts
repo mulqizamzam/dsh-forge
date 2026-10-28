@@ -843,6 +843,9 @@ describe('external DSH operation recovery', () => {
   it('keeps an uninstall journal when DSH fails and preserves the observed installed state', async () => {
     const record = await addValidatedTestedRecord(store, 'uninstall-journal')
     const installPath = join(root, 'installed', record.id)
+    await mkdir(join(installPath, 'lib'), { recursive: true })
+    await writeFile(join(installPath, 'package.json'), record.files.find(file => file.path === 'package.json')!.content)
+    await writeFile(join(installPath, 'lib/index.js'), record.files.find(file => file.path === 'lib/index.js')!.content)
     await store.update(record.id, {
       status: 'installed',
       install: { installed: true, profile: 'web', installPath, at: new Date().toISOString() },
