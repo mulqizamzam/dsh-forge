@@ -108,6 +108,8 @@ By default, both `forge_install` and `forge_activate` require:
 
 These are preflight checks, not a security boundary for all plugin behavior. The test uses a fake context and cannot verify every real-host API interaction. Installation mutates the real DSH profile and is not run inside the sandbox. A plugin may still behave unexpectedly after installation or activation.
 
+If install or uninstall is interrupted or the DSH command changes the profile but Forge cannot commit its state, the record keeps an operation journal. Inspect the actual DSH profile, then call `forge_reconcile` with `observedInstalled: true` if the package is present or `false` if it is absent. Reconciliation is deliberately manual; Forge does not guess whether the external side effect happened.
+
 Read [SECURITY.md](SECURITY.md) before running plugins you did not write or audit.
 
 ## Development
