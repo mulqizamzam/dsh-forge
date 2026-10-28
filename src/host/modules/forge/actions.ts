@@ -1290,23 +1290,63 @@ export async function reconcilePluginOperation(
       if (!record) return { ok: false, error: 'record not found or invalid record ID: ' + id }
       const operation = record.operation
       if (!operation) return { ok: false, error: 'record has no unfinished install/uninstall operation to reconcile' }
-      const now = new Date().toISOString()
-      const patch: Partial<ForgeRecord> = observedInstalled
-        ? {
-            status: 'installed',
-            install: { installed: true, profile: operation.profile, installPath: operation.installPath, at: now },
-            active: undefined,
-            operation: undefined,
+      const installedRoot = join(resolve(deps.store.getRoot()), 'installed')
+      const installedRootInfo = await lstat(installedRoot).catch(() => null)
+      if (!installedRootInfo || !installedRootInfo.isDirectory() || installedRootInfo.isSymbolicLink()) {
+        return { ok: false, error: 'installed state root is missing or is not a real directory; operation journal retained' }
+      }
+      const expectedInstallPath = containPath(installedRoot, id)
+      if (!expectedInstallPath || resolve(operation.installPath) !== expectedInstallPath) {
+        return { ok: false, error: 'journal installPath does not match the record-scoped Forge install path; refusing to remove or claim it' }
+      }
+
+      return await deps.store.withExclusiveLock('profile', operation.profile, async () => {
+        // Re-read inside both locks, so a stale record snapshot cannot erase a newer journal.
+        const current = await deps.store.get(id)
+        if (!current?.operation) return { ok: false, error: 'operation journal changed or was already reconciled' }
+        const currentOperation = current.operation
+        if (currentOperation.profile !== operation.profile ||
+            currentOperation.kind !== operation.kind ||
+            currentOperation.startedAt !== operation.startedAt) {
+          return { ok: false, error: 'operation journal changed while acquiring recovery locks; retry after inspection' }
+        }
+        const installInfo = await lstat(expectedInstallPath).catch(() => null)
+        if (observedInstalled) {
+          if (!installInfo || !installInfo.isDirectory() || installInfo.isSymbolicLink()) {
+            return { ok: false, error: 'DSH reports the package installed, but the Forge materialized directory is missing or unsafe; journal retained' }
           }
-        : {
-            status: statusAfterUninstall(record),
-            install: undefined,
-            active: undefined,
-            operation: undefined,
+          if (!(await exists(join(expectedInstallPath, 'package.json'))) ||
+              !(await exists(join(expectedInstallPath, 'lib/index.js')))) {
+            return { ok: false, error: 'DSH reports the package installed, but the materialized manifest or runtime entry is missing; journal retained' }
           }
-      const updated = await deps.store.update(id, patch)
-      if (!updated) return { ok: false, error: 'could not commit reconciled state; operation journal was retained when possible' }
-      return { ok: true, status: updated.status, observedInstalled }
+        } else if (installInfo) {
+          if (!installInfo.isDirectory() || installInfo.isSymbolicLink()) {
+            return { ok: false, error: 'refusing to remove an unsafe install path; journal retained' }
+          }
+          // A verified absent DSH package means the operation-owned materialized
+          // source tree can be removed before clearing the journal. If state commit
+          // fails, retrying observedInstalled=false remains safe.
+          await rm(expectedInstallPath, { recursive: true, force: true })
+        }
+
+        const now = new Date().toISOString()
+        const patch: Partial<ForgeRecord> = observedInstalled
+          ? {
+              status: 'installed',
+              install: { installed: true, profile: currentOperation.profile, installPath: expectedInstallPath, at: now },
+              active: undefined,
+              operation: undefined,
+            }
+          : {
+              status: statusAfterUninstall(current),
+              install: undefined,
+              active: undefined,
+              operation: undefined,
+            }
+        const updated = await deps.store.update(id, patch)
+        if (!updated) return { ok: false, error: 'could not commit reconciled state; operation journal was retained when possible' }
+        return { ok: true, status: updated.status, observedInstalled }
+      }, 180_000)
     }, 180_000)
   } catch (e) {
     return { ok: false, error: 'reconciliation failed: ' + (e instanceof Error ? e.message : String(e)) }

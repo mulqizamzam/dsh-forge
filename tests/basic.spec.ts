@@ -800,6 +800,7 @@ describe('external DSH operation recovery', () => {
     expect(finalRecord?.operation).toBeUndefined()
     expect(finalRecord?.install).toBeUndefined()
     expect(finalRecord?.status).toBe('tested')
+    await expect(readFile(join(root, 'installed', record.id, 'package.json'), 'utf8')).rejects.toThrow()
   })
 
   it('reconciles an external install that succeeded when the final Forge write fails', async () => {
@@ -836,6 +837,7 @@ describe('external DSH operation recovery', () => {
     expect(finalRecord?.status).toBe('installed')
     expect(finalRecord?.install?.installed).toBe(true)
     expect(finalRecord?.operation).toBeUndefined()
+    expect(await readFile(join(root, 'installed', record.id, 'lib/index.js'), 'utf8')).toContain('export function apply')
   })
 
   it('keeps an uninstall journal when DSH fails and preserves the observed installed state', async () => {
