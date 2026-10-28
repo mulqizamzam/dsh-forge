@@ -841,64 +841,79 @@ export async function activatePlugin(
   id: string,
 ): Promise<{ ok: true; toolNames: string[] } | { ok: false; error: string }> {
   const record = await deps.store.get(id)
-  if (!record) return { ok: false, error: 'record not found: ' + id }
+  if (!record) return { ok: false, error: 'record not found or invalid record ID: ' + id }
   if (activeFibers.has(id)) return { ok: false, error: 'plugin is already active in this host' }
-  if (!record.validation?.valid) return { ok: false, error: 'cannot activate: static validation must pass first' }
-  if (!record.test?.passed) return { ok: false, error: 'cannot activate: sandbox test must pass first' }
-
-  // Never trust installPath loaded from mutable JSON; derive the path from the
-  // configured store root and record ID, and recreate the tree to remove symlinks
-  // or stale files left by a previously interrupted write.
-  const installPath = join(deps.store.getRoot(), 'installed', id)
-  const runtimeEntry = record.files.find(f => f.path === 'lib/index.js')
-  if (!runtimeEntry) return { ok: false, error: 'record has no lib/index.js runtime entry' }
-  const entryPath = join(installPath, runtimeEntry.path)
-  try { await rm(installPath, { recursive: true, force: true }) } catch { /* recreate below; writes still fail closed */ }
-  for (const f of record.files) {
-    const target = containPath(installPath, f.path)
-    if (target === null) return { ok: false, error: 'unsafe file path: ' + f.path }
-    await mkdir(dirname(target), { recursive: true })
-    await writeFile(target, f.content, { encoding: 'utf8', mode: 0o644 })
-  }
+  const evidenceError = freshEvidenceError(record, { requireValidation: true, requireTest: true })
+  if (evidenceError) return { ok: false, error: 'cannot activate: ' + evidenceError }
+  const safetyError = validateSafeFileSet(record.files)
+  if (safetyError) return { ok: false, error: safetyError }
 
   const ctx = deps.ctx
   if (typeof ctx.plugin !== 'function') {
     return { ok: false, error: 'host context does not expose ctx.plugin — dynamic mount unavailable' }
   }
 
+  const materialized = await materializeInstallTree(deps, id, record.files)
+  if (!materialized.ok) return { ok: false, error: materialized.error }
+  const installPath = materialized.installPath
+  const entryPath = join(installPath, 'lib/index.js')
+  const digest = pluginContentDigest(record.files)
+  if (!digest) return { ok: false, error: 'record files are malformed' }
+
   let mod: { apply?: unknown }
   try {
-    mod = await import(pathToFileURL(entryPath).href) as { apply?: unknown }
+    // ESM caches imports by URL. A content query prevents re-activation from
+    // reusing stale code after the same record ID has been updated on disk.
+    const entryUrl = pathToFileURL(entryPath)
+    entryUrl.searchParams.set('sha256', digest)
+    mod = await import(entryUrl.href) as { apply?: unknown }
   } catch (e) {
     return { ok: false, error: 'dynamic import failed: ' + (e instanceof Error ? e.message : String(e)) }
   }
   if (typeof mod.apply !== 'function') return { ok: false, error: 'module does not export an apply function' }
 
   const registered: string[] = []
-  const originalRegister = ctx.tools.register.bind(ctx.tools)
-  const patchedRegister = (def: { name?: unknown }) => {
+  const originalRegister = ctx.tools.register
+  const patchedRegister = function (this: unknown, def: { name?: unknown }) {
     if (def && typeof def.name === 'string') registered.push(def.name)
-    originalRegister(def as never)
+    return originalRegister.call(ctx.tools, def as never)
   }
-  ;(ctx.tools as { register: typeof patchedRegister }).register = patchedRegister
+  try {
+    ctx.tools.register = patchedRegister as typeof ctx.tools.register
+  } catch (e) {
+    return { ok: false, error: 'host tool registry cannot be instrumented: ' + (e instanceof Error ? e.message : String(e)) }
+  }
 
   let fiber: { dispose?: () => unknown } | undefined
+  let mountError: string | undefined
   try {
-    fiber = ctx.plugin(mod, {}) as { dispose?: () => unknown }
-    await (fiber as unknown as Promise<unknown>)
+    const mounted = ctx.plugin(mod, {})
+    fiber = mounted && typeof (mounted as { then?: unknown }).then === 'function'
+      ? await mounted as { dispose?: () => unknown }
+      : mounted as { dispose?: () => unknown } | undefined
+    if (!fiber || typeof fiber !== 'object') throw new Error('mount produced no fiber')
+    activeFibers.set(id, fiber)
+    const updated = await deps.store.update(id, {
+      status: 'active',
+      active: { mounted: true, toolNames: registered.slice(), at: new Date().toISOString() },
+    })
+    if (!updated) throw new Error('mount succeeded but forge state could not be updated')
   } catch (e) {
-    return { ok: false, error: 'mount failed: ' + (e instanceof Error ? e.message : String(e)) }
+    mountError = e instanceof Error ? e.message : String(e)
+    activeFibers.delete(id)
+    if (fiber && typeof fiber.dispose === 'function') {
+      try { await fiber.dispose() } catch (disposeError) {
+        mountError += '; cleanup also failed: ' + (disposeError instanceof Error ? disposeError.message : String(disposeError))
+      }
+    }
   } finally {
-    // C1 fix — always restore, including success path, to avoid closure leak.
-    ;(ctx.tools as { register: typeof originalRegister }).register = originalRegister
+    // Restore the exact original function reference even when mounting fails.
+    try { ctx.tools.register = originalRegister } catch { /* host may freeze the registry after registration */ }
   }
-  if (!fiber) return { ok: false, error: 'mount produced no fiber' }
 
-  activeFibers.set(id, fiber)
-  await deps.store.update(id, {
-    status: 'active',
-    active: { mounted: true, toolNames: registered.slice(), at: new Date().toISOString() },
-  })
+  if (mountError) {
+    return { ok: false, error: 'mount failed: ' + mountError }
+  }
   return { ok: true, toolNames: registered }
 }
 
@@ -906,6 +921,7 @@ export async function deactivatePlugin(
   deps: ModuleDeps,
   id: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!/^[a-f0-9]{12}$/.test(id)) return { ok: false, error: 'invalid record ID' }
   const fiber = activeFibers.get(id)
   if (!fiber) return { ok: false, error: 'plugin is not active in this host' }
   try {
@@ -915,8 +931,17 @@ export async function deactivatePlugin(
   }
   activeFibers.delete(id)
   const record = await deps.store.get(id)
-  const status = record?.install?.installed ? 'installed' : record?.test?.passed ? 'tested' : 'validated'
-  await deps.store.update(id, { status, active: undefined })
+  const digest = record ? pluginContentDigest(record.files) : null
+  const status = record?.install?.installed ? 'installed'
+    : record?.test?.passed && digest && record.test.contentSha256 === digest ? 'tested'
+      : record?.validation?.valid && digest && record.validation.contentSha256 === digest ? 'validated'
+        : 'generated'
+  try {
+    const updated = await deps.store.update(id, { status, active: undefined })
+    if (!updated) return { ok: false, error: 'plugin was disposed but forge state could not be updated' }
+  } catch (e) {
+    return { ok: false, error: 'plugin was disposed but forge state update failed: ' + (e instanceof Error ? e.message : String(e)) }
+  }
   return { ok: true }
 }
 
