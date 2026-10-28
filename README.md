@@ -38,7 +38,7 @@ Validation and sandbox tests reduce risk; they do **not** prove that a plugin is
 
 ## Requirements
 
-- Node.js **20 or later**
+- Node.js **22.18.0 or later** (required by the Git-install build tool)
 - npm (the repository pins npm **10.9.9** as its package manager)
 - A compatible DSH host; the package declares DSH **`>=0.1.1-rc.1`**
 - Linux with Bubblewrap (`bwrap`) for the sandbox test workflow
@@ -59,11 +59,19 @@ Or build and install from source:
 git clone https://github.com/mulqizamzam/dsh-forge.git
 cd dsh-forge
 npm ci
-npm run build
 dsh plugin --profile web add .
 ```
 
 Replace `web` with the DSH profile you intend to use.
+
+GitHub installs run the package's `prepare` lifecycle to build `lib/index.js`; no manual build command is needed. pnpm 10+ may block install-time build scripts until explicitly allowed. If DSH prints an `allowBuilds` instruction, add the following to the target profile's `pnpm-workspace.yaml` and retry the install:
+
+```yaml
+allowBuilds:
+  dsh-forge: true
+```
+
+This permission allows the package's install-time build script to execute on your machine. Only allow packages whose source you trust.
 
 ## Configuration
 
