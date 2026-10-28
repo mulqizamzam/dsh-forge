@@ -64,14 +64,16 @@ dsh plugin --profile web add .
 
 Replace `web` with the DSH profile you intend to use.
 
-GitHub installs run the package's `prepare` lifecycle to build `lib/index.js`; no manual build command is needed. pnpm 10+ may block install-time build scripts until explicitly allowed. If DSH prints an `allowBuilds` instruction, add the following to the target profile's `pnpm-workspace.yaml` and retry the install:
+GitHub installs run the package's `prepare` lifecycle to build `lib/index.js`; no manual build command is needed. pnpm blocks unapproved install-time build scripts by default. When DSH prints an `allowBuilds` instruction, copy the **entire package key exactly as printed** into the target profile's `pnpm-workspace.yaml` and set it to `true`. For a GitHub dependency fetched as a codeload tarball, the key can include the resolved commit URL, so a package-name-only entry such as `dsh-forge: true` may not match the artifact.
+
+For the command you ran, first make sure your file contains this entry (merge it with any existing `allowBuilds` entries rather than replacing them):
 
 ```yaml
 allowBuilds:
-  dsh-forge: true
+  'dsh-forge@https://codeload.github.com/mulqizamzam/dsh-forge/tar.gz/d260a2c078ef7ec42d1495cd51dbc6c47aa08794': true
 ```
 
-This permission allows the package's install-time build script to execute on your machine. Only allow packages whose source you trust.
+This example matches commit `d260a2c078ef7ec42d1495cd51dbc6c47aa08794`. If pnpm printed a different key, use that exact key instead. Then rerun the same `dsh plugin --profile web add github:mulqizamzam/dsh-forge#main` command while `main` still resolves to that commit; otherwise pin the command to the same SHA. This permission lets the package's source execute during install, outside the sandbox. Allow only code you have reviewed and trust.
 
 ## Configuration
 
